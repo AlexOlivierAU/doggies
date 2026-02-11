@@ -1,0 +1,33 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Cache and local data
+dog_rater_live/cache/
+cache/
+*.json
+!**/package.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Env and secrets
+.env
+.env.local
+*.pem
+
+# Streamlit
+.streamlit/secrets.toml
