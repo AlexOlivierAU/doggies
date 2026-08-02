@@ -48,5 +48,6 @@ class Runner:
     jockey_or_driver: Optional[str] = None
     last10: Optional[str] = None
     scratched: bool = False
+    silk_url: Optional[str] = None  # jockey silks image URL (thoroughbred)
     raw: dict[str, Any] = field(default_factory=dict)
 

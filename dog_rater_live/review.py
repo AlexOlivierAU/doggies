@@ -75,17 +75,38 @@ def fetch_greyhound_results_for_meeting(meeting_url: str) -> dict[int, RaceResul
     return out
 
 
-def _racingnsw_results_url_from_stage(meeting_url: str) -> str:
+def _key_from_meeting_url(meeting_url: str) -> str:
     parsed = urlparse(meeting_url)
     qs = parse_qs(parsed.query)
-    key = (qs.get("key") or qs.get("Key") or [""])[0]
+    return (qs.get("key") or qs.get("Key") or [""])[0].strip()
+
+
+def _racingnsw_results_url_from_stage(meeting_url: str) -> str:
+    key = _key_from_meeting_url(meeting_url)
     if not key:
         raise ValueError("Missing key param for RacingNSW meeting URL.")
     return f"https://mdata.racingnsw.com.au/FreeFields/Results.aspx?Key={key}"
 
 
+def _thoroughbred_results_url_from_meeting(meeting_url: str) -> str:
+    """
+    Prefer Racing Australia Results.aspx for all-AU meetings.
+
+    Racing NSW Results.aspx 500s on non-NSW keys (e.g. VIC/QLD venues) even when the
+    Key= shape looks the same, so only use the NSW mirror for NSW-hosted URLs.
+    """
+    key = _key_from_meeting_url(meeting_url)
+    if not key:
+        raise ValueError("Missing key param for thoroughbred meeting URL.")
+    host = (urlparse(meeting_url).netloc or "").lower()
+    if "racingnsw" in host and ",nsw," in f",{key.lower()},":
+        return f"https://mdata.racingnsw.com.au/FreeFields/Results.aspx?Key={key}"
+    return f"https://www.racingaustralia.horse/FreeFields/Results.aspx?Key={key}"
+
+
 def fetch_racingnsw_results_for_meeting(meeting_url: str) -> dict[int, RaceResult]:
-    url = _racingnsw_results_url_from_stage(meeting_url)
+    """Parse placings from a Racing NSW / Racing Australia Results.aspx page."""
+    url = _thoroughbred_results_url_from_meeting(meeting_url)
     html = get(url, ttl_seconds=60, timeout_seconds=30).text
     soup = BeautifulSoup(html, "html.parser")
 

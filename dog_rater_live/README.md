@@ -1,48 +1,31 @@
 # dog_rater_live
 
-`dog_rater_live` is a fun, exploratory Streamlit app that pulls near‑realtime Australian race field/card information from public websites (greyhounds + horses), ranks runners by plausibility, and explains **why this runner could win**.
+Streamlit app that pulls near‑realtime Australian (and some NZ) race fields from public websites, ranks runners, and explains **why this runner could win**. Supports greyhounds, thoroughbreds, and harness.
 
 ## Disclaimer
 
-- This project is **for fun / modelling only**.
-- It is **NOT betting advice**.
-- It uses **public, free websites** and does not use paid APIs, odds feeds, authentication, or external services.
-- Any weather/conditions displayed are **informational only** and may be incomplete or inaccurate.
+- **For fun / modelling only.** Not betting advice.
+- Uses **public, free websites** only — no paid APIs, odds feeds, or auth.
+- Weather/conditions are informational and may be incomplete.
+
+---
 
 ## Data sources
 
-### Greyhounds
+| Code | Source | Notes |
+|------|--------|------|
+| **Greyhounds (AU)** | thedogs.com.au | Fields + racecards; RAS fallback (best-effort). |
+| **Thoroughbred (AU)** | racingaustralia.horse | Calendar, Acceptances, Race Program. Times in meeting local time; app converts to selected timezone. |
+| **Harness (NSW)** | harness.org.au | Fields + form (NSW). |
+| **Harness (NZ)** | hrnz.co.nz | HRNZ fields index + meeting pages. |
+| **Greyhounds (NZ)** | GRNZ / Hatrick Straight | Meetings + fallback when fetch fails; runner parsing best-effort. |
+| **Thoroughbred (NZ)** | nzracing.co.nz | Meetings only (race/runner parsing stubbed). |
 
-- Primary: `https://www.thedogs.com.au/racing` (Fields / racecards + meeting/race pages)
-- Fallback: `https://www.racingandsports.com.au/form-guide/greyhound` (best-effort; often blocked by bot protection)
+Weather (optional) comes from a public API (e.g. Open-Meteo) for venue context only.
 
-### Thoroughbreds (All AU)
+See **PARSERS.md** for implementation status per parser.
 
-- Racing Australia FreeFields (public pages, best-effort scraping):
-  - Calendar per state: `https://www.racingaustralia.horse/FreeFields/Calendar.aspx?State=...`
-  - Acceptances / runners: `https://www.racingaustralia.horse/FreeFields/Acceptances.aspx?Key=YYYYMonDD,STATE,VENUE`
-  - Race program (often has reliable race times): `https://www.racingaustralia.horse/FreeFields/RaceProgram.aspx?Key=...`
-
-Notes:
-- Racing Australia displays times in the **local time of the meeting**; the app converts these to your selected app timezone
-  (default `Australia/Sydney`) so races can be ordered correctly across Australia.
-- Some meetings may appear on the calendar with only “Weights/Program” links; the app still includes them and will prefer
-  Acceptances when available.
-
-### Harness (NSW)
-
-- Australian Harness Racing fields + form (`https://www.harness.org.au/nsw-fields-index.cfm`, `form.cfm?mc=...`)
-
-### New Zealand
-
-- **Harness (NZ)**: HRNZ fields index and meeting pages (`https://infohorse.hrnz.co.nz/datahrs/fields/fields.htm`).
-- **Greyhounds (NZ)** and **Thoroughbred (NZ)**: stubs (no parser yet); selectable in UI for future use.
-- **All (AU+NZ)**: unified Next-to-Jump grid across AU + NZ; NZ times use `Pacific/Auckland`.
-
-### Weather (optional)
-
-- The app can optionally show **external live weather** for some venues using a public endpoint (currently Open‑Meteo).
-- This is for context only and is **not a predictive model**.
+---
 
 ## Requirements
 
@@ -50,51 +33,76 @@ Notes:
 
 ## Install
 
+From the **repo root** (or from `dog_rater_live`):
+
 ```bash
 cd dog_rater_live
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Run (Streamlit)
+## Run
+
+**Streamlit (recommended):**
 
 ```bash
 streamlit run app.py
 ```
 
-## Key UI features
+Or use the startup script (creates venv, installs deps, runs Streamlit):
 
-- **Code selector**: Greyhounds, Thoroughbred (All AU), Harness (NSW), **All (AU)**, Greyhounds (NZ), Harness (NZ), Thoroughbred (NZ), **All (AU+NZ)**.
-- **Timezone selector**: default `Australia/Sydney`; also `Pacific/Auckland` for NZ.
-- **Refresh loaded data**: forces meetings/races to reload (helpful when sources update or caching hides a venue).
-- **Race roster (what’s run / what’s next)**:
-  - Show finished races (default ON)
-  - Only show next upcoming per venue (default OFF)
-  - Show best pick (optional; can be slow)
-- **WHY** and **Odds**: per-row popovers in interactive roster mode.
-- **Daily review (winners vs our picks)**: compares saved picks vs fetched results (best-effort).
+```bash
+./start.sh
+```
 
-## Run (CLI)
+---
 
-### Greyhounds
+## UI overview
+
+- **Code**: Greyhounds, Thoroughbred (AU), Harness (NSW), **All (AU)**, Greyhounds (NZ), Harness (NZ), Thoroughbred (NZ), **All (AU+NZ)**.
+- **Timezone**: e.g. Australia/Sydney, Pacific/Auckland.
+- **Roster**: Next-to-jump grid; type filter **All | Thoroughbred | Harness | Greyhound**; optional “only next per venue”, “show finished” (default off), Sky overlay (default on).
+- **Daily review**: Compare saved picks to fetched results (winner only; best-effort).
+- **Compression backtest (TB)**: Measure whether small score gaps (Rank 1 vs 2/3) correlate with place-heavy outcomes; run over a date range and see win/place rates by clustered vs clear-edge.
+
+---
+
+## CLI
+
+**Greyhounds:**
 
 ```bash
 python dog_rater_live.py --date 2026-02-06 --venue "Wentworth" --race 1
 ```
 
-### Horses
-
-Thoroughbred (All AU):
+**Thoroughbred (AU):**
 
 ```bash
 python horse_rater_live.py --code thoroughbred --date 2026-02-07 --venue "Caulfield" --race 1
 ```
 
-Harness (NSW):
+**Harness (NSW):**
 
 ```bash
 python horse_rater_live.py --code harness --date 2026-02-06 --venue "Newcastle" --race 1
 ```
 
+**Compression backtest (TB, last 7 days):**
 
+```bash
+python -m backtest_compression
+```
+
+---
+
+## Repo layout
+
+- `app.py` — Streamlit app (roster, picks, review, compression backtest).
+- `scoring.py` — Runner ranking (weights, form, draw, conditions).
+- `review.py` — Fetch results (winners, place getters for TB) for daily review and backtest.
+- `backtest_compression.py` — Compression index backtest and report.
+- `parse_*.py` — Parsers for each code/source (see PARSERS.md).
+- `journal.py` — Save/load picks for daily review.
+- `db_cache.py` — SQLite cache for parsed meetings/fields (persists across app restarts; `cache/roster.db`).
+- `race_db.py` — Persistent daily race data, picks, and results in the same DB: load/save fields by date, "Update race" to refresh one race, store picks (roster + journal), and persist results so Daily review can match picks to winners/place without re-fetching.

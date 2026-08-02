@@ -305,6 +305,26 @@ def fetch_races_and_runners_for_meeting(meeting_url: str, meeting_date: date, *,
 
         runners_by_race[race_no] = rs
 
+    # Full card: if form guide only shows upcoming (e.g. R2+), fill gaps so grid shows R1, R2, ...
+    if races:
+        existing_nos = {r.race_no for r in races}
+        max_no = max(existing_nos)
+        for race_no in range(1, max_no):
+            if race_no in existing_nos:
+                continue
+            races.append(
+                Race(
+                    code="harness",
+                    race_no=race_no,
+                    name=f"Race {race_no}",
+                    distance_m=None,
+                    start_time_local=None,
+                    race_url=meeting_url + f"#race{race_no}",
+                    extra={},
+                )
+            )
+            runners_by_race[race_no] = []
+
     races.sort(key=lambda r: r.race_no)
     return races, runners_by_race
 
