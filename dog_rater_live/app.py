@@ -810,24 +810,10 @@ def render_roster_content(*, chosen_date: date, code_label: str, meetings: list,
         draw = getattr(r_obj, "draw", None)
 
         if code == "thoroughbred":
-            # TV shows program/saddle cloth number ("No"), not barrier. Prefer No when present.
-            raw = getattr(r_obj, "raw", {}) or {}
-            headers = raw.get("headers") or []
-            cells = raw.get("cells") or []
-            hn = [str(h).strip().lower() for h in headers]
-            idx = None
-            for i, h in enumerate(hn):
-                if h in {"no.", "no", "number", "saddle", "program", "#", "num", "runner no", "runner no."}:
-                    idx = i
-                    break
-            if idx is not None and 0 <= idx < len(cells):
-                import re
-                m = re.search(r"\b(\d{1,2})\b", str(cells[idx]))
-                if m:
-                    return m.group(1)
-            if draw is not None:
-                return str(draw)
-            return ""
+            from services.runner_numbers import program_number_for_runner
+
+            n = program_number_for_runner(r_obj)
+            return str(n) if n is not None else ""
 
         # Greyhound (and any code with draw): use box/draw number when present
         if draw is not None:
@@ -888,7 +874,9 @@ def render_roster_content(*, chosen_date: date, code_label: str, meetings: list,
         """e.g. '3. Horse (7) $4.8↓ ↑' — program no, name, barrier, odds/fluc, class arrow."""
         if not name:
             return ""
-        core = f"{no}. {name}" if no else name
+        from services.formatting import format_runner_pick
+
+        core = format_runner_pick(number=no, name=name, odds=None)
         bar = _barrier_for_name(runners, name)
         if bar:
             core = f"{core} ({bar})"

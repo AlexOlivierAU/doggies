@@ -106,6 +106,8 @@ def _migrate_picks_columns(conn: sqlite3.Connection) -> None:
             ("primary_scratched", "INTEGER"),
             ("backup_promoted", "INTEGER"),
             ("scheduled_jump", "TEXT"),
+            ("primary_number", "INTEGER"),
+            ("backup_number", "INTEGER"),
         ),
     )
 
@@ -346,7 +348,8 @@ _PICK_SELECT = """
     pick_data, saved_at, roughie, best_score, backup_score, roughie_score,
     field_size, status, just_place, just_place_score,
     locked, locked_at, confidence_label, score_gap, primary_odds, backup_odds,
-    original_primary, primary_scratched, backup_promoted, scheduled_jump
+    original_primary, primary_scratched, backup_promoted, scheduled_jump,
+    primary_number, backup_number
 """
 
 
@@ -380,6 +383,8 @@ def _row_to_pick(r: tuple) -> dict:
         primary_scratched,
         backup_promoted,
         scheduled_jump,
+        primary_number,
+        backup_number,
     ) = r
     extra = {
         "locked": bool(locked),
@@ -392,6 +397,8 @@ def _row_to_pick(r: tuple) -> dict:
         "primary_scratched": bool(primary_scratched),
         "backup_promoted": bool(backup_promoted),
         "scheduled_jump": scheduled_jump or "",
+        "primary_number": primary_number,
+        "backup_number": backup_number,
         "saved_at": saved_at,
         "roughie": roughie or "",
         "just_place": just_place or "",
@@ -428,6 +435,12 @@ def _row_to_pick(r: tuple) -> dict:
                 if just_place:
                     cond.setdefault("just_place", just_place)
             obj.update(extra)
+            if obj.get("primary_number") is None:
+                snap = obj.get("snapshot") if isinstance(obj.get("snapshot"), dict) else {}
+                obj["primary_number"] = snap.get("primary_number")
+            if obj.get("backup_number") is None:
+                snap = obj.get("snapshot") if isinstance(obj.get("snapshot"), dict) else {}
+                obj["backup_number"] = snap.get("backup_number")
             return obj
         except Exception:
             pass
@@ -509,6 +522,8 @@ def save_pick(
     primary_scratched: Optional[bool] = None,
     backup_promoted: Optional[bool] = None,
     scheduled_jump: str = "",
+    primary_number: Optional[int] = None,
+    backup_number: Optional[int] = None,
     force: bool = False,
     db_path: Path = _DEFAULT_DB,
 ) -> bool:
@@ -580,6 +595,22 @@ def save_pick(
                 scheduled_jump = str(snap.get("scheduled_jump") or pick_data.get("scheduled_jump") or "")
             if not original_primary:
                 original_primary = str(snap.get("original_primary") or pick_data.get("original_primary") or "")
+            if primary_number is None:
+                raw_no = snap.get("primary_number")
+                if raw_no is None:
+                    raw_no = pick_data.get("primary_number")
+                try:
+                    primary_number = int(raw_no) if raw_no not in (None, "") else None
+                except (TypeError, ValueError):
+                    primary_number = None
+            if backup_number is None:
+                raw_no = snap.get("backup_number")
+                if raw_no is None:
+                    raw_no = pick_data.get("backup_number")
+                try:
+                    backup_number = int(raw_no) if raw_no not in (None, "") else None
+                except (TypeError, ValueError):
+                    backup_number = None
 
         if existing_pick:
             if locked is None:
@@ -592,6 +623,10 @@ def save_pick(
                 primary_scratched = bool(existing_pick.get("primary_scratched"))
             if backup_promoted is None:
                 backup_promoted = bool(existing_pick.get("backup_promoted"))
+            if primary_number is None:
+                primary_number = existing_pick.get("primary_number")
+            if backup_number is None:
+                backup_number = existing_pick.get("backup_number")
             if not blob and existing[8]:
                 blob = existing[8]
             if primary_odds is None:
@@ -611,8 +646,9 @@ def save_pick(
                 pick_data, saved_at, roughie, best_score, backup_score, roughie_score,
                 field_size, status, just_place, just_place_score,
                 locked, locked_at, confidence_label, score_gap, primary_odds, backup_odds,
-                original_primary, primary_scratched, backup_promoted, scheduled_jump)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                original_primary, primary_scratched, backup_promoted, scheduled_jump,
+                primary_number, backup_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 d.isoformat(),
                 meeting_url,
@@ -642,6 +678,8 @@ def save_pick(
                 1 if primary_scratched else 0,
                 1 if backup_promoted else 0,
                 scheduled_jump or "",
+                primary_number,
+                backup_number,
             ),
         )
         conn.commit()

@@ -9,9 +9,11 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from parse_racingaustralia import runner_class_arrow, runner_last_class
-from services.race_day_service import RaceView, build_race_views, number_for_name
+from services.formatting import format_runner_pick, markdown_safe_pick
+from services.race_day_service import RaceView, build_race_views
 from services.ranking import rank_field
-from ui.components import inject_base_css, pick_cell
+from services.runner_numbers import program_number_for_runner
+from ui.components import inject_base_css, pick_cell, pick_metric
 
 
 def render_race_details(
@@ -76,9 +78,12 @@ def render_race_details(
     if view.from_snapshot:
         st.info("Primary/backup below are the **saved snapshot**, not a live re-rank of an old race.")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Primary", pick_cell(view.primary_no, view.primary, view.odds))
-    c2.metric("Backup", pick_cell(view.backup_no, view.backup, view.backup_odds))
-    c3.metric("Confidence", view.confidence_label or "—")
+    with c1:
+        pick_metric("Primary", pick_cell(view.primary_no, view.primary, view.odds))
+    with c2:
+        pick_metric("Backup", pick_cell(view.backup_no, view.backup, view.backup_odds))
+    with c3:
+        st.metric("Confidence", view.confidence_label or "—")
 
     ranked, weights, rationale = rank_field(view.runners, track_condition=view.meta.get("track_condition"))
     runner_by_name = {getattr(r, "name", ""): r for r in view.runners}
@@ -90,14 +95,14 @@ def render_race_details(
 
     for rr in ranked:
         runner = runner_by_name.get(rr.name)
-        no = number_for_name(view.runners, rr.name)
+        no = program_number_for_runner(runner) if runner is not None else None
         mark = ""
         if rr.name == view.primary:
             mark = " · PRIMARY"
         elif rr.name == view.backup:
             mark = " · BACKUP"
         scratched = bool(getattr(runner, "scratched", False)) if runner else False
-        title = f"{no or '—'} {rr.name}{mark} · {rr.score:.3f}"
+        title = markdown_safe_pick(f"{format_runner_pick(number=no, name=rr.name)}{mark} · {rr.score:.3f}")
         if scratched:
             title += " · SCRATCHED"
         with st.expander(title, expanded=(rr.rank <= 2)):
@@ -117,7 +122,7 @@ def render_race_details(
             last_cls = runner_last_class(runner)
             arrow = runner_class_arrow(runner, view.race_class)
             st.write(
-                f"**No/barrier:** {no or '—'} / {runner.draw if runner.draw is not None else '—'}  \n"
+                f"**No/barrier:** {no if no is not None else '—'} / {runner.draw if runner.draw is not None else '—'}  \n"
                 f"**Odds:** {win_odds or '—'} {flucs}  \n"
                 f"**Form:** {runner.last10 or '—'}  \n"
                 f"**Class:** {last_cls or '—'} {arrow}  \n"

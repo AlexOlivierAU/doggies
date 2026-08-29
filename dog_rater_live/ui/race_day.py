@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as html_lib
 from datetime import date, datetime
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -24,7 +25,8 @@ from services.result_service import (
     resolve_pick_result,
     sync_missing_results,
 )
-from ui.components import data_status_chip, inject_base_css, pick_cell, status_badge
+from services.formatting import format_saved_selection
+from ui.components import data_status_chip, inject_base_css, pick_cell, pick_metric, status_badge
 
 
 def _open_race(view: RaceView) -> None:
@@ -60,6 +62,8 @@ def _save_and_lock(view: RaceView, chosen_date: date, db_path=None, *, lock: boo
         field=snapshot_field(view.runners, ranked_by_name),
         primary_odds=view.odds,
         backup_odds=view.backup_odds,
+        primary_number=view.primary_no,
+        backup_number=view.backup_no,
         scheduled_jump=view.jump_at.isoformat() if view.jump_at else "",
         track_condition=view.track_condition,
         status=view.status,
@@ -249,9 +253,9 @@ def _render_hero(hero: RaceView, now: datetime, chosen_date: date) -> None:
     )
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Primary", pick_cell(hero.primary_no, hero.primary, hero.odds))
+        pick_metric("Primary", pick_cell(hero.primary_no, hero.primary, hero.odds))
     with c2:
-        st.metric("Backup", pick_cell(hero.backup_no, hero.backup, hero.backup_odds))
+        pick_metric("Backup", pick_cell(hero.backup_no, hero.backup, hero.backup_odds))
     with c3:
         st.metric("Confidence", hero.confidence_label or "—")
         st.caption("Label from score gap, not a probability.")
@@ -276,7 +280,7 @@ def _render_upcoming_table(rows: list[RaceView], now: datetime) -> None:
                 "Venue": r.venue,
                 "Race": f"R{r.race_no}",
                 "Primary": pick_cell(r.primary_no, r.primary, r.odds),
-                "Backup": pick_cell(r.backup_no, r.backup),
+                "Backup": pick_cell(r.backup_no, r.backup, r.backup_odds),
                 "Confidence": r.confidence_label,
                 "Status": r.status,
                 "_token": token,
@@ -341,10 +345,10 @@ def _render_todays_picks(views: list[RaceView], picks_index: dict, results_by_ke
                 "Result": resolved.status,
                 "Time": clock,
                 "Race": f"{venue} R{race_no}",
-                "Primary": pick.get("original_primary") or pick.get("pick_name") or "",
+                "Primary": format_saved_selection(pick, "primary"),
                 "Primary pos": resolved.primary_finish_label,
                 "Saved odds": pick.get("primary_odds") if pick.get("primary_odds") is not None else "—",
-                "Backup": pick.get("backup") or "",
+                "Backup": format_saved_selection(pick, "backup"),
                 "Backup pos": resolved.backup_finish_label,
                 "Source": resolved.result_source or resolved.match_note,
             }
@@ -369,14 +373,14 @@ def _render_todays_picks(views: list[RaceView], picks_index: dict, results_by_ke
             html_rows.append(
                 "<tr>"
                 f"<td>{status_badge(rec['Result'])}</td>"
-                f"<td>{rec['Time']}</td>"
-                f"<td>{rec['Race']}</td>"
-                f"<td>{rec['Primary']}</td>"
-                f"<td>{rec['Primary pos']}</td>"
-                f"<td>{rec['Saved odds']}</td>"
-                f"<td>{rec['Backup']}</td>"
-                f"<td>{rec['Backup pos']}</td>"
-                f"<td class='rd-muted'>{rec['Source']}</td>"
+                f"<td>{html_lib.escape(str(rec['Time']))}</td>"
+                f"<td>{html_lib.escape(str(rec['Race']))}</td>"
+                f"<td>{html_lib.escape(str(rec['Primary']))}</td>"
+                f"<td>{html_lib.escape(str(rec['Primary pos']))}</td>"
+                f"<td>{html_lib.escape(str(rec['Saved odds']))}</td>"
+                f"<td>{html_lib.escape(str(rec['Backup']))}</td>"
+                f"<td>{html_lib.escape(str(rec['Backup pos']))}</td>"
+                f"<td class='rd-muted'>{html_lib.escape(str(rec['Source']))}</td>"
                 "</tr>"
             )
         st.markdown(

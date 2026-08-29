@@ -20,6 +20,11 @@ from race_db import (
     save_pick,
 )
 from services.confidence import confidence_from_scores
+from services.runner_numbers import (
+    coerce_program_number,
+    number_from_field_snapshot,
+    program_number_for_runner,
+)
 
 LOCK_BEFORE_JUMP = timedelta(minutes=2)
 
@@ -51,6 +56,8 @@ def build_snapshot_payload(
     scratching_state: Optional[list[dict[str, Any]]] = None,
     primary_odds: Optional[float] = None,
     backup_odds: Optional[float] = None,
+    primary_number: Optional[int] = None,
+    backup_number: Optional[int] = None,
     scheduled_jump: str = "",
     track_condition: str = "",
     status: str = "",
@@ -83,11 +90,21 @@ def build_snapshot_payload(
     )
     payload = dict(entry.__dict__)
     payload["backup"] = backup or ""
+    if primary_number is None:
+        primary_number = number_from_field_snapshot(field, primary)
+    if backup_number is None:
+        backup_number = number_from_field_snapshot(field, backup)
+    primary_number = coerce_program_number(primary_number)
+    backup_number = coerce_program_number(backup_number)
+    payload["primary_number"] = primary_number
+    payload["backup_number"] = backup_number
     payload["snapshot"] = {
         "confidence_label": label,
         "score_gap": gap,
         "primary_odds": primary_odds,
         "backup_odds": backup_odds,
+        "primary_number": primary_number,
+        "backup_number": backup_number,
         "scheduled_jump": scheduled_jump,
         "field": list(field or []),
         "scratching_state": list(scratching_state or []),
@@ -159,6 +176,10 @@ def save_selection_snapshot(
         primary_odds=primary_odds if primary_odds is not None else snap.get("primary_odds"),
         backup_odds=backup_odds if backup_odds is not None else snap.get("backup_odds"),
         scheduled_jump=scheduled_jump or str(snap.get("scheduled_jump") or ""),
+        primary_number=coerce_program_number((pick_data or {}).get("primary_number"))
+        or coerce_program_number(snap.get("primary_number")),
+        backup_number=coerce_program_number((pick_data or {}).get("backup_number"))
+        or coerce_program_number(snap.get("backup_number")),
         locked=lock,
         locked_at=(datetime.now().timestamp() if lock else None),
         db_path=db_path,
@@ -217,6 +238,7 @@ def snapshot_field(runners: list, ranked_by_name: Optional[dict[str, Any]] = Non
         out.append(
             {
                 "name": name,
+                "program_number": program_number_for_runner(r),
                 "draw": getattr(r, "draw", None),
                 "scratched": bool(getattr(r, "scratched", False)),
                 "jockey": getattr(r, "jockey_or_driver", None),

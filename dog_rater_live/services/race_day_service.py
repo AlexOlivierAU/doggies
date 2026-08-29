@@ -11,6 +11,7 @@ from models import Meeting, Race, Runner
 from parse_racingaustralia import parse_race_class_label
 from services.formatting import format_clock, format_countdown, minutes_until, tb_race_duration
 from services.ranking import rank_field, selections_from_ranked
+from services.runner_numbers import program_number_for_name, program_number_for_runner, saved_pick_number
 
 STATE_TZ = {
     "NSW": "Australia/Sydney",
@@ -85,30 +86,14 @@ def compact_track_condition(raw: str) -> str:
 
 
 def runner_program_number(runner: Runner) -> str:
-    raw = getattr(runner, "raw", {}) or {}
-    headers = raw.get("headers") or []
-    cells = raw.get("cells") or []
-    hn = [str(h).strip().lower() for h in headers]
-    idx = None
-    for i, h in enumerate(hn):
-        if h in {"no.", "no", "number", "saddle", "program", "#", "num", "runner no", "runner no."}:
-            idx = i
-            break
-    if idx is not None and 0 <= idx < len(cells):
-        import re
-
-        m = re.search(r"\b(\d{1,2})\b", str(cells[idx]))
-        if m:
-            return m.group(1)
-    draw = getattr(runner, "draw", None)
-    return str(draw) if draw is not None else ""
+    """Official program/saddle number as display text. Never the barrier."""
+    n = program_number_for_runner(runner)
+    return str(n) if n is not None else ""
 
 
 def number_for_name(runners: list[Runner], name: str) -> str:
-    r = next((x for x in runners if getattr(x, "name", None) == name), None)
-    if r is None:
-        return ""
-    return runner_program_number(r)
+    n = program_number_for_name(runners, name)
+    return str(n) if n is not None else ""
 
 
 @dataclass
@@ -169,6 +154,10 @@ def _row_status(now: datetime, jump_at: Optional[datetime]) -> str:
     if now <= jump_at + tb_race_duration():
         return "in_progress"
     return "finished"
+
+
+def live_status(now: datetime, jump_at: Optional[datetime]) -> str:
+    return _row_status(now, jump_at)
 
 
 def chronological_sort_key(row: RaceView) -> tuple:
@@ -286,8 +275,8 @@ def build_race_views(
             row.confidence_label = str(saved.get("confidence_label") or "")
             row.odds = saved.get("primary_odds")
             row.backup_odds = saved.get("backup_odds")
-            row.primary_no = number_for_name(row.runners, row.primary)
-            row.backup_no = number_for_name(row.runners, row.backup)
+            row.primary_no = str(n) if (n := saved_pick_number(saved, "primary")) is not None else ""
+            row.backup_no = str(n) if (n := saved_pick_number(saved, "backup")) is not None else ""
             row.why = list(saved.get("why_bullets") or [])
             row.weights = dict(saved.get("weights") or {})
             if saved.get("primary_scratched"):

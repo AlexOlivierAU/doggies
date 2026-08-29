@@ -48,7 +48,7 @@ def _dt(h: int, m: int = 0) -> datetime:
     return datetime(2026, 8, 29, h, m, tzinfo=SYD)
 
 
-def _runner(name: str, draw: int = 1, scratched: bool = False, finishes: list[int] | None = None) -> Runner:
+def _runner(name: str, draw: int = 1, scratched: bool = False, finishes: list[int] | None = None, program_number: int | None = None) -> Runner:
     return Runner(
         code="thoroughbred",
         name=name,
@@ -58,6 +58,7 @@ def _runner(name: str, draw: int = 1, scratched: bool = False, finishes: list[in
         scratched=scratched,
         weight_kg=56.0 + draw,
         benchmark=60.0 + draw,
+        program_number=program_number,
     )
 
 
@@ -222,6 +223,8 @@ def test_legacy_database_migration_keeps_existing_picks(tmp_path: Path):
     assert "confidence_label" in cols
     assert "locked" in cols
     assert "primary_scratched" in cols
+    assert "primary_number" in cols
+    assert "backup_number" in cols
     picks = load_picks(date(2026, 8, 1), db_path=db)
     assert len(picks) == 1
     assert picks[0]["pick_name"] == "Legacy Horse"

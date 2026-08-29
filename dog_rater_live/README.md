@@ -16,6 +16,12 @@ Greyhound and harness sources remain available under **Settings**, but they are 
 
 ## Screenshot
 
+Streamlit Race Day (placeholder): `docs/race-day.png`
+
+Desktop Race Day Rater: `docs/race-day-desktop.png`
+
+---
+
 Add a Race Day screenshot here when one is available:
 
 `docs/race-day.png` (placeholder)
@@ -47,6 +53,94 @@ See **PARSERS.md** for implementation status per parser.
 - Python **3.10+**
 
 ## Install
+
+From `dog_rater_live`:
+
+```bash
+cd dog_rater_live
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+For tests and lint:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+For the PySide6 desktop app:
+
+```bash
+pip install -r requirements-desktop.txt
+```
+
+## Run
+
+**Desktop (Race Day Rater):**
+
+```bash
+python -m desktop.main
+```
+
+macOS / Linux:
+
+```bash
+chmod +x start-desktop.sh
+./start-desktop.sh
+```
+
+Windows (from `dog_rater_live` with the venv activated):
+
+```bat
+python -m desktop.main
+```
+
+The default screen is **Race Day**. Streamlit remains fully supported:
+
+```bash
+streamlit run app.py
+```
+
+or `./start.sh`.
+
+---
+
+## Desktop
+
+**Race Day Rater** is a Qt Widgets app (not a web view). It reuses the same SQLite DB, parsers, scoring, pick snapshots and result matching as Streamlit.
+
+| Question | Where |
+|----------|--------|
+| What runs next? | Next-to-jump card |
+| Number + name of the pick? | Primary line (`5. NAME · $4.80`) — program number, not barrier |
+| Backup? | Backup line on the card and Upcoming table |
+| Current odds? | Hero, Upcoming, Race Details (Sportsbet public feed, best-effort) |
+| Which races finished? | Today's picks + History |
+| Did primary/backup win or place? | Result column (`WIN`, `PLACED`, `BACKUP WON`, …) |
+| Is data healthy? | Toolbar indicator + status bar |
+
+**Background refresh** (when Auto-refresh is on):
+
+- Countdown: every 1s, local only, no network
+- Odds: default 45s
+- Meetings/fields: default 3 minutes
+- Results for jumped races: default 30s until resolved
+
+Overlapping jobs are coalesced. A failed source does not clear a populated table. Offline start uses `daily_meetings` / `daily_fields` in SQLite.
+
+**Current desktop limitations**
+
+- Model weight sliders and compression backtest stay in Streamlit (`Model` page explains this).
+- Greyhound/harness grids stay in Streamlit Settings.
+- Notifications are in-app (status bar), not native OS toasts.
+- No signed installer yet (see Packaging below).
+
+Screenshot: `docs/race-day-desktop.png`
+
+---
+
+## Navigation
 
 From `dog_rater_live`:
 
@@ -128,6 +222,21 @@ After a race jumps:
 From `dog_rater_live`:
 
 ```bash
+pip install -r requirements-dev.txt -r requirements-desktop.txt
+python -m compileall -q .
+ruff check services ui tests desktop
+QT_QPA_PLATFORM=offscreen pytest -q
+```
+
+Tests use synthetic data and a temporary SQLite file. They do not hit live racing websites. Qt widget tests use the offscreen platform plugin.
+
+GitHub Actions installs desktop dependencies, compiles, runs Ruff (including `desktop/`), runs pytest with `QT_QPA_PLATFORM=offscreen`, and imports `desktop.main.create_app` without starting the event loop.
+
+---
+
+From `dog_rater_live`:
+
+```bash
 pytest -q
 ruff check services ui tests
 python -m compileall -q .
@@ -168,6 +277,38 @@ python -m backtest_compression
 ---
 
 ## Repo layout
+
+- `app.py` — Streamlit entry: session load, navigation, existing fetch/cache helpers, legacy roster grid.
+- `desktop/` — PySide6 Race Day Rater (`python -m desktop.main`).
+- `ui/` — Streamlit Race Day, Race Details, History, Model, Settings.
+- `services/` — confidence labels, pick snapshots, result matching, race-day view models, card loader (no Streamlit).
+- `scoring.py` — Runner ranking (heuristic weights, form, draw, conditions).
+- `review.py` — Fetch results (winners, place getters for TB).
+- `backtest_compression.py` — Compression backtest.
+- `parse_*.py` — Parsers (see PARSERS.md).
+- `journal.py` — JSON pick journal (still merged with SQLite on load).
+- `db_cache.py` — SQLite HTTP/parse cache (`cache/roster.db`).
+- `race_db.py` — Daily fields, picks (including locked snapshots), results, jockey rides.
+- `tests/` — Deterministic domain tests plus `tests/desktop/` Qt tests.
+
+## Architecture
+
+Desktop widgets never fetch HTML or rank fields directly. `ApplicationController` talks to `RefreshWorker` on a `QThread`. The worker calls `services.card_loader`, `build_race_views`, odds, and result sync, then emits a bundle. The GUI thread updates table models. Each `race_db` call opens and closes its own SQLite connection inside the operation that uses it.
+
+## Packaging
+
+No distributable `.app` / `.exe` is produced in this repository yet. Each OS should build its own artifact (Qt plugins and signing differ). After `pip install pyside6`, a later step can use `pyside6-deploy`:
+
+```bash
+# macOS (run on a Mac)
+pyside6-deploy desktop/main.py -n "Race Day Rater"
+
+# Windows (run on Windows)
+pyside6-deploy desktop/main.py -n "Race Day Rater"
+```
+
+macOS notarisation and Windows Authenticode signing are not configured. Do not treat those commands as a release until they have been run and the resulting app launched on that OS.
+
 
 - `app.py` — Streamlit entry: session load, navigation, existing fetch/cache helpers, legacy roster grid.
 - `ui/` — Race Day, Race Details, History, Model, Settings.

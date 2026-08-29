@@ -10,6 +10,30 @@ from bs4 import BeautifulSoup
 
 from fetch import FetchError, get
 from models import Meeting, Race, Runner
+from services.runner_numbers import parse_program_number_cell, program_number_from_raw
+
+
+def official_program_number(headers: list, cells: list) -> Optional[int]:
+    """Official saddle/program number from an Acceptances (or similar) row.
+
+    Never returns the barrier/draw. Returns None when the No column is absent
+    and the horse cell has no leading cloth number.
+    """
+    hlow = [str(h).strip().lower() for h in (headers or [])]
+
+    def idx(*names: str) -> Optional[int]:
+        for nm in names:
+            if nm.lower() in hlow:
+                return hlow.index(nm.lower())
+        return None
+
+    i_no = idx("no", "no.", "number", "#", "saddle", "program", "cloth")
+    i_barrier = idx("barrier")
+    if i_no is not None and i_no < len(cells or []) and i_no != i_barrier:
+        n = parse_program_number_cell(cells[i_no])
+        if n is not None:
+            return n
+    return program_number_from_raw(headers, cells)
 
 
 BASE = "https://www.racingaustralia.horse"
@@ -624,13 +648,14 @@ def fetch_races_and_runners_for_meeting(meeting_url: str, *, ttl_seconds: int = 
                         age = int(re.sub(r"[^\d]", "", cells[i_age]) or "")
                     except Exception:
                         age = None
-                # barrier
+                # barrier (draw) — distinct from official program/saddle number
                 draw = None
                 if i_barrier is not None and i_barrier < len(cells):
                     try:
                         draw = int(re.sub(r"[^\d]", "", cells[i_barrier]) or "0") or None
                     except Exception:
                         draw = None
+                program_number = official_program_number(headers, cells)
                 # weight
                 wt = None
                 if i_weight is not None and i_weight < len(cells):
@@ -667,7 +692,8 @@ def fetch_races_and_runners_for_meeting(meeting_url: str, *, ttl_seconds: int = 
                         jockey_or_driver=jockey,
                         last10=last10 or None,
                         scratched=is_scratched,
-                        raw={"headers": headers, "cells": cells},
+                        raw={"headers": headers, "cells": cells, "program_number": program_number},
+                        program_number=program_number,
                     )
                 )
 

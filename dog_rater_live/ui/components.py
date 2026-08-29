@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import html as html_lib
 from typing import Optional
 
 import streamlit as st
 
+from services.formatting import format_runner_pick
 from services.result_service import (
     AWAITING_RESULT,
     BACKUP_WON,
@@ -46,6 +48,7 @@ def inject_base_css() -> None:
   .rd-kicker {color:#9aa0a6;font-size:0.8rem;letter-spacing:0.04em;text-transform:uppercase;}
   .rd-muted {color:#9aa0a6;font-size:0.85rem;}
   .rd-metric {padding:0.4rem 0;}
+  .rd-pick {font-size:1.2rem;font-weight:650;line-height:1.35;margin-top:0.15rem;white-space:normal;}
 </style>
 """,
         unsafe_allow_html=True,
@@ -76,16 +79,20 @@ def data_status_chip(status: str, last_ok: Optional[str]) -> None:
     )
 
 
-def pick_cell(no: str, name: str, odds: Optional[float] = None) -> str:
-    if not name:
-        return "—"
-    core = f"{no}. {name}" if no else name
-    if odds is not None:
-        try:
-            core = f"{core} ${float(odds):.1f}"
-        except (TypeError, ValueError):
-            pass
-    return core
+def pick_cell(no, name: str, odds: Optional[float] = None) -> str:
+    return format_runner_pick(number=no, name=name, odds=odds)
+
+
+def pick_metric_html(label: str, value: str) -> str:
+    """HTML for a labelled pick. Avoids st.metric, which turns '5. NAME' into a markdown list."""
+    return (
+        f'<div class="rd-metric"><div class="rd-kicker">{html_lib.escape(label)}</div>'
+        f'<div class="rd-pick">{html_lib.escape(value)}</div></div>'
+    )
+
+
+def pick_metric(label: str, value: str) -> None:
+    st.markdown(pick_metric_html(label, value), unsafe_allow_html=True)
 
 
 def urgency_style(token: str) -> str:

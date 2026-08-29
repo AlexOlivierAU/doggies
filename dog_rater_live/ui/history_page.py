@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as html_lib
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -9,6 +10,7 @@ import streamlit as st
 
 from race_db import get_pick, load_picks_range, load_results_range
 from services.confidence import LABEL_CLOSE, LABEL_MEDIUM, LABEL_STRONG
+from services.formatting import format_saved_selection
 from services.result_service import (
     AWAITING_RESULT,
     BACKUP_WON,
@@ -142,13 +144,13 @@ def render_history(*, app_tz: ZoneInfo, default_date: date) -> None:
     for rec in rows:
         html.append(
             "<tr>"
-            f"<td>{rec.get('date')}</td>"
+            f"<td>{html_lib.escape(str(rec.get('date') or ''))}</td>"
             f"<td>{status_badge(rec['status'])}</td>"
-            f"<td>{rec.get('venue')} R{rec.get('race_no')}</td>"
-            f"<td>{rec.get('original_primary') or rec.get('pick_name') or ''}</td>"
-            f"<td>{rec.get('primary_finish_label')}</td>"
-            f"<td>{rec.get('primary_odds') if rec.get('primary_odds') is not None else '—'}</td>"
-            f"<td>{rec.get('backup') or ''}</td>"
+            f"<td>{html_lib.escape(str(rec.get('venue') or ''))} R{rec.get('race_no')}</td>"
+            f"<td>{html_lib.escape(format_saved_selection(rec, 'primary'))}</td>"
+            f"<td>{html_lib.escape(str(rec.get('primary_finish_label') or ''))}</td>"
+            f"<td>{html_lib.escape(str(rec.get('primary_odds') if rec.get('primary_odds') is not None else '—'))}</td>"
+            f"<td>{html_lib.escape(format_saved_selection(rec, 'backup'))}</td>"
             f"<td>{rec.get('backup_finish_label')}</td>"
             f"<td>{rec.get('confidence_label') or '—'}</td>"
             "</tr>"
@@ -168,8 +170,8 @@ def render_history(*, app_tz: ZoneInfo, default_date: date) -> None:
             return
         st.write(
             f"**Locked:** {bool(snap.get('locked'))}  \n"
-            f"**Primary:** {snap.get('original_primary') or snap.get('pick_name')}  \n"
-            f"**Backup:** {snap.get('backup')}  \n"
+            f"**Primary:** {format_saved_selection(snap, 'primary')}  \n"
+            f"**Backup:** {format_saved_selection(snap, 'backup')}  \n"
             f"**Confidence:** {snap.get('confidence_label')} (gap {snap.get('score_gap')})  \n"
             f"**Odds at selection:** {snap.get('primary_odds')} / backup {snap.get('backup_odds')}  \n"
             f"**Picked at:** {snap.get('picked_at_iso') or snap.get('saved_at')}  \n"

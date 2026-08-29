@@ -50,4 +50,5 @@ class Runner:
     scratched: bool = False
     silk_url: Optional[str] = None  # jockey silks image URL (thoroughbred)
     raw: dict[str, Any] = field(default_factory=dict)
+    program_number: Optional[int] = None  # official saddle/program No; not barrier
 
