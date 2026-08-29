@@ -66,19 +66,27 @@ from odds_sportsbet import (
 )
 from db_cache import get as db_get, set as db_set, TTL_MEETINGS, TTL_FIELDS, TTL_SKY
 from race_db import (
-    backfill_jockey_rides,
-    db_status,
+    get_pick as db_get_pick,
     jockey_stats,
     load_daily_fields as db_load_daily_fields,
     load_picks as db_load_picks,
     load_results as db_load_results,
+    load_results_for_date as db_load_results_for_date,
     merge_meeting_fields as db_merge_meeting_fields,
     persist_daily_fields as db_persist_daily_fields,
     persist_daily_meetings as db_persist_daily_meetings,
+    persist_result_failure as db_persist_result_failure,
     persist_results as db_persist_results,
     save_pick as db_save_pick,
     update_race_runners_in_db as db_update_race_runners,
 )
+from services.confidence import confidence_from_scores
+from services.race_day_service import resolve_tz
+from ui.history_page import render_history
+from ui.model_page import render_model
+from ui.race_day import render_race_day
+from ui.race_details import render_race_details
+from ui.settings_page import render_settings
 
 
 def load_picks(d: date) -> list:
@@ -146,6 +154,7 @@ def autosave_roster_picks(chosen_date: date, rows: list) -> int:
         except (TypeError, ValueError):
             field_size_int = None
         status = str(rr.get("status") or "")
+        gap, conf = confidence_from_scores(best_score, backup_score)
         try:
             entry = make_pick_entry(
                 meeting_date=chosen_date,
@@ -191,6 +200,8 @@ def autosave_roster_picks(chosen_date: date, rows: list) -> int:
                 status=status,
                 just_place=just_place,
                 just_place_score=just_place_score,
+                confidence_label=conf,
+                score_gap=gap,
             )
             saved += 1
         except Exception:
@@ -292,7 +303,7 @@ except ImportError:
     _AGGRID_AVAILABLE = False
     JsCode = None  # type: ignore
 
-st.set_page_config(page_title="dog_rater_live", layout="wide")
+st.set_page_config(page_title="Race Day", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
@@ -3502,180 +3513,63 @@ def show_meetings_dialog(chosen_date: date, meetings: list, fields_by_meeting: d
     st.caption("Tip: meeting links are included in the table for copy/paste.")
 
 
-def main() -> None:
-    today = date.today()
-    # Avoid calling `next_upcoming_meeting()` directly since it refetches thedogs racecards on every rerun,
-    # which can trigger intermittent 403 blocks. Instead, compute from our cached meetings list.
-    m = None
-    try:
-        todays = cached_dog_meetings(today)
-        if not todays:
-            todays = try_fetch_dog_meetings_fallback(today)
-        now = datetime.now().astimezone()
-        best = None  # (dt, meeting)
-        for mtg in todays:
-            if mtg.first_race_time_local is None:
-                continue
-            dt = datetime.combine(mtg.meeting_date, mtg.first_race_time_local, tzinfo=now.tzinfo)
-            if dt >= now and (best is None or dt < best[0]):
-                best = (dt, mtg)
-        if best is not None:
-            m = best[1]
-    except (FetchError, DogsParseError) as e:
-        st.warning(f"Could not compute next meeting from cached meetings: {e}")
 
-    if m is not None:
-        # Best-effort "top pick for next race" (greyhounds only; this banner is from thedogs flow).
-        pick = None
+def init_session_defaults() -> None:
+    ss = st.session_state
+    ss.setdefault("nav_page", "Race Day")
+    ss.setdefault("tz_name", "Australia/Sydney")
+    ss.setdefault("code_label", "Thoroughbred (All AU)")
+    ss.setdefault("auto_refresh", False)
+    ss.setdefault("refresh_interval_sec", 60)
+    ss.setdefault("refresh_nonce", 0)
+    ss.setdefault("state_filter", "All")
+    ss.setdefault("selected_race", None)
+    ss.setdefault("last_data_ok_at", None)
+    ss.setdefault("data_status", "idle")
+    ss.setdefault("include_other_codes", False)
+    if "chosen_date" not in ss:
+        ss.chosen_date = date.today()
+
+
+def ensure_meetings_and_fields(code: str, chosen_date: date) -> tuple[list, dict]:
+    """Load meetings + fields using the existing cache/DB merge path."""
+    _meetings_code = str(code)
+    _meetings_date = chosen_date.isoformat() if hasattr(chosen_date, "isoformat") else str(chosen_date)
+    _meetings_refresh = int(st.session_state.get("refresh_nonce", 0))
+    _m_stored_code = st.session_state.get("meetings_loaded_code")
+    _m_stored_date = st.session_state.get("meetings_loaded_date")
+    _m_stored_refresh = st.session_state.get("meetings_loaded_refresh", -1)
+    _meetings_need_reload = (
+        "meetings" not in st.session_state
+        or not st.session_state.meetings
+        or _m_stored_code is None
+        or _m_stored_code != _meetings_code
+        or _m_stored_date != _meetings_date
+        or _m_stored_refresh != _meetings_refresh
+    )
+    if "meetings" not in st.session_state:
+        st.session_state.meetings = []
+    if _meetings_need_reload:
         try:
-            pick = cached_next_greyhound_pick(m.meeting_url, m.meeting_date, m.venue)
-        except Exception:
-            pick = None
-
-        if pick is not None:
-            st.caption(
-                f"**Top pick (next race):** {pick['venue']} R{pick['race_no']} ({pick['race_time']}) — "
-                f"{pick['pick_name']} (score {pick['pick_score']:.3f})"
-            )
-
-            if "show_next_pick_why" not in st.session_state:
-                st.session_state.show_next_pick_why = False
-            b1, b2 = st.columns([0.25, 0.75], vertical_alignment="center")
-            with b1:
-                if st.button("Why?", key="btn_next_pick_why"):
-                    st.session_state.show_next_pick_why = not st.session_state.show_next_pick_why
-            with b2:
-                with st.expander(
-                    "Why we like this pick (click to expand)",
-                    expanded=bool(st.session_state.show_next_pick_why),
-                ):
-                    for b in pick.get("why_bullets") or []:
-                        st.write(f"- {b}")
-                    st.caption(f"Race link: {pick.get('race_url')}")
-
-    st.divider()
-
-    with st.expander("Controls", expanded=False):
-        ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.3, 1.4], vertical_alignment="top")
-
-        with ctrl1:
-            code = st.selectbox(
-                "Code",
-                options=[
-                    "Greyhounds",
-                    "Thoroughbred (All AU)",
-                    "Thoroughbred (AU + NZ)",
-                    "Harness (NSW)",
-                    "All (AU)",
-                    "Greyhounds (NZ)",
-                    "Harness (NZ)",
-                    "Thoroughbred (NZ)",
-                    "All (AU+NZ)",
-                ],
-                index=1,  # default: Thoroughbred (All AU)
-            )
-            chosen_date = st.date_input("Date", value=today)
-            tz_name = st.selectbox("Timezone", options=["Australia/Sydney", "Pacific/Auckland", "Local (server)"], index=0)
-            st.session_state.tz_name = tz_name
-            if "refresh_nonce" not in st.session_state:
-                st.session_state.refresh_nonce = 0
-            if st.button("Refresh loaded data", help="Force reload meetings/races (use if a venue seems missing)."):
-                st.session_state.refresh_nonce = int(st.session_state.refresh_nonce) + 1
-            if code == "Greyhounds":
-                st.caption("Meetings + races auto-load for the chosen date.")
-            elif code == "Thoroughbred (All AU)":
-                st.caption("AU thoroughbred grid via Racing Australia FreeFields — race roster with best picks, backup, and roughie.")
-            elif code == "Thoroughbred (AU + NZ)":
-                st.caption("Thoroughbreds AU + NZ — race roster grid with best picks (Racing Australia + NZ Racing).")
-            elif code == "Harness (NSW)":
-                st.caption("Meetings + races auto-load for the chosen date (NSW harness).")
-            elif code == "All (AU)":
-                st.caption("Unified grid: greyhounds + thoroughbreds + harness (AU), sorted by next to jump.")
-            elif code in ("Greyhounds (NZ)", "Harness (NZ)", "Thoroughbred (NZ)"):
-                st.caption("NZ meetings (Harness NZ from HRNZ; greyhound/TB stubs when no parser yet).")
-            elif code == "All (AU+NZ)":
-                st.caption("Unified grid: AU + NZ (greyhounds, thoroughbreds, harness), sorted by next to jump.")
-            else:
-                st.caption("Meetings + races auto-load for the chosen date.")
-
-        # --- Auto-load meetings for chosen date + code (so buttons below can use meetings) ---
-        # Only reload when user has explicitly changed date/code or clicked Refresh (not on Save/Results/etc.)
-        _meetings_code = str(code)
-        _meetings_date = chosen_date.isoformat() if hasattr(chosen_date, "isoformat") else str(chosen_date)
-        _meetings_refresh = int(st.session_state.get("refresh_nonce", 0))
-        _m_stored_code = st.session_state.get("meetings_loaded_code")
-        _m_stored_date = st.session_state.get("meetings_loaded_date")
-        _m_stored_refresh = st.session_state.get("meetings_loaded_refresh", -1)
-        _meetings_need_reload = (
-            "meetings" not in st.session_state
-            or not st.session_state.meetings
-            or _m_stored_code is None
-            or _m_stored_code != _meetings_code
-            or _m_stored_date != _meetings_date
-            or _m_stored_refresh != _meetings_refresh
-        )
-        if "meetings" not in st.session_state:
+            meetings = get_meetings_for_code(code, chosen_date, _meetings_refresh)
+            st.session_state.meetings = meetings
+            st.session_state.meetings_loaded_key = (_meetings_code, _meetings_date, _meetings_refresh)
+            st.session_state.meetings_loaded_code = _meetings_code
+            st.session_state.meetings_loaded_date = _meetings_date
+            st.session_state.meetings_loaded_refresh = _meetings_refresh
+            # Persist meeting list for tracking / reload without live source.
+            if meetings and chosen_date:
+                db_persist_daily_meetings(chosen_date, _meetings_code, meetings)
+        except (FetchError, DogsParseError, RacingAUSParseError, HarnessParseError, HrnzNzParseError, NzRacingParseError) as e:
             st.session_state.meetings = []
-        if _meetings_need_reload:
-            try:
-                meetings = get_meetings_for_code(code, chosen_date, _meetings_refresh)
-                st.session_state.meetings = meetings
-                st.session_state.meetings_loaded_key = (_meetings_code, _meetings_date, _meetings_refresh)
-                st.session_state.meetings_loaded_code = _meetings_code
-                st.session_state.meetings_loaded_date = _meetings_date
-                st.session_state.meetings_loaded_refresh = _meetings_refresh
-                # Persist meeting list for tracking / reload without live source.
-                if meetings and chosen_date:
-                    db_persist_daily_meetings(chosen_date, _meetings_code, meetings)
-            except (FetchError, DogsParseError, RacingAUSParseError, HarnessParseError, HrnzNzParseError, NzRacingParseError) as e:
-                st.session_state.meetings = []
-                st.session_state.meetings_loaded_key = (_meetings_code, _meetings_date, _meetings_refresh)
-                st.session_state.meetings_loaded_code = _meetings_code
-                st.session_state.meetings_loaded_date = _meetings_date
-                st.session_state.meetings_loaded_refresh = _meetings_refresh
-                st.error(f"Could not load meetings: {e}")
+            st.session_state.meetings_loaded_key = (_meetings_code, _meetings_date, _meetings_refresh)
+            st.session_state.meetings_loaded_code = _meetings_code
+            st.session_state.meetings_loaded_date = _meetings_date
+            st.session_state.meetings_loaded_refresh = _meetings_refresh
+            st.error(f"Could not load meetings: {e}")
 
-        meetings = st.session_state.meetings
+    meetings = st.session_state.meetings
 
-        with ctrl3:
-            st.markdown("**Tracking database**")
-            _db = db_status()
-            st.caption(f"`{_db.get('path', '')}`")
-            st.caption(
-                f"Picks **{_db.get('picks', 0)}** · Results **{_db.get('results', 0)}** · "
-                f"Jockey rides **{_db.get('jockey_rides', 0)}** · "
-                f"Fields **{_db.get('daily_fields', 0)}** · Meetings **{_db.get('daily_meetings', 0)}** · "
-                f"HTTP cache **{_db.get('cache', 0)}**"
-            )
-            _pbd = _db.get("picks_by_date") or []
-            if _pbd:
-                st.caption("Picks by date: " + ", ".join(f"{d}×{n}" for d, n in _pbd[:5]))
-            _rbd = _db.get("results_by_date") or []
-            if _rbd:
-                st.caption("Results by date: " + ", ".join(f"{d}×{n}" for d, n in _rbd[:5]))
-            st.caption(
-                "Roster autosaves best / if scratched / roughie + scores. "
-                "Fields & meetings save on load. Results save when you open Results / Daily review "
-                "(and sync jockey rides from the field)."
-            )
-            if st.button("Backfill jockey rides", help="Rebuild ride ledger from all stored results + fields"):
-                with st.spinner("Backfilling jockey rides..."):
-                    bf = backfill_jockey_rides()
-                st.success(f"Backfilled **{bf.get('rides', 0)}** rides across **{bf.get('meetings', 0)}** meeting result sets.")
-                st.rerun()
-
-        with ctrl1:
-            show_meetings = st.button("Show meetings for this date", disabled=(not meetings))
-            if show_meetings:
-                show_meetings_dialog(chosen_date, meetings, st.session_state.get("fields_by_meeting"))
-            show_review = st.button("Daily review (winners vs our picks)")
-            if show_review:
-                daily_review_dialog(chosen_date)
-            show_compression = st.button("Compression backtest (TB)")
-            if show_compression:
-                compression_backtest_dialog(chosen_date)
-
-    # Ensure meetings/refresh_nonce in scope for rest of page (same values as set inside expander)
     if "meetings" not in st.session_state:
         st.session_state.meetings = []
     refresh_nonce = int(st.session_state.get("refresh_nonce", 0))
@@ -3899,472 +3793,119 @@ def main() -> None:
             merged_fbm[meeting_url] = {"races": merged[0], "runners_by_race": merged_runners, "meta": merged[2]}
         fields_by_meeting = merged_fbm
 
-    if code in ("All (AU)", "All (AU+NZ)"):
-        tz_name_au = st.session_state.get("tz_name") or "Australia/Sydney"
-        app_tz_au = None
-        if tz_name_au and tz_name_au != "Local (server)":
-            try:
-                app_tz_au = ZoneInfo(tz_name_au)
-            except Exception:
-                pass
-        now_au = datetime.now(app_tz_au).astimezone() if app_tz_au else datetime.now().astimezone()
+    st.session_state.data_status = "ok"
+    st.session_state.last_data_ok_at = datetime.now().strftime("%H:%M:%S")
+    return st.session_state.get("meetings") or [], fields_by_meeting
 
-        # Sky Next Up panel (schedule.skyracing.com.au overlay)
+
+def _odds_lookup(chosen_date: date):
+    idx = cached_odds_event_index(chosen_date)
+
+    def lookup(venue: str, race_no, horse: str):
+        if not horse or race_no is None or not idx:
+            return None
         try:
-            sky_list = cached_sky_schedule(chosen_date)
-            if sky_list:
-                sky_next = sorted(sky_list, key=lambda x: (x.get("channel", ""), x.get("venue", ""), x.get("race_no", 0)))[:5]
-                with st.expander("Sky Next Up (Sky 1/2 schedule)", expanded=False):
-                    for s in sky_next:
-                        ch = s.get("channel", "")
-                        ven = s.get("venue", "")
-                        rn = s.get("race_no", "")
-                        dt_sky = s.get("dt_app_tz") or s.get("dt_local")
-                        t_str = dt_sky.strftime("%H:%M") if dt_sky else "—"
-                        st.caption(f"**{ch}** {ven} R{rn} — {t_str}")
+            rn = int(race_no)
         except Exception:
-            pass
-
-        def _tz_tb_au(m) -> ZoneInfo | None:
-            if getattr(m, "code", "") != "thoroughbred":
-                return None
-            # NZ thoroughbred: Pacific/Auckland
-            if (getattr(m, "extra", {}) or {}).get("country") == "NZ":
-                return ZoneInfo("Pacific/Auckland")
-            st_code = (getattr(m, "extra", {}) or {}).get("state") or ""
-            st_code = str(st_code).upper().strip()
-            if st_code in {"NSW", "VIC", "TAS", "ACT"}:
-                return ZoneInfo("Australia/Sydney")
-            if st_code == "QLD":
-                return ZoneInfo("Australia/Brisbane")
-            if st_code == "SA":
-                return ZoneInfo("Australia/Adelaide")
-            if st_code == "NT":
-                return ZoneInfo("Australia/Darwin")
-            if st_code == "WA":
-                return ZoneInfo("Australia/Perth")
             return None
+        eid = lookup_event_id(idx, str(venue or ""), rn)
+        if eid is None:
+            return None
+        return (cached_race_odds(int(eid)) or {}).get(_odds_norm_horse(horse))
 
-        unified_rows: list[dict] = []
-        for m in meetings:
-            mf = fields_by_meeting.get(getattr(m, "meeting_url", ""), {}) or {}
-            races_au = mf.get("races") or []
-            m_code = getattr(m, "code", "") or ""
-            country = (getattr(m, "extra", {}) or {}).get("country") or "AU"
-            venue_au = getattr(m, "venue", "") or ""
-            state_code = (getattr(m, "extra", {}) or {}).get("state") or ""
-            if m_code == "thoroughbred" and state_code:
-                venue_au = f"{venue_au} ({state_code})"
-            mtg_tz_au = _tz_tb_au(m) if m_code == "thoroughbred" else _tz_for_greyhound_meeting(m) if m_code == "greyhound" else None
-            if mtg_tz_au is None and country == "NZ":
-                mtg_tz_au = ZoneInfo("Pacific/Auckland")
-            if mtg_tz_au is None and app_tz_au:
-                mtg_tz_au = app_tz_au
-            per_race_au = timedelta(minutes=25 if m_code == "greyhound" else 35 if m_code == "thoroughbred" else 30)
-            for r in races_au:
-                start_t = getattr(r, "start_time_local", None)
-                dt_au = None
-                approx_au = False
-                if isinstance(start_t, time):
-                    dt_local = datetime.combine(chosen_date, start_t, tzinfo=(mtg_tz_au or now_au.tzinfo))
-                    dt_au = dt_local.astimezone(app_tz_au) if app_tz_au else dt_local
-                elif m_code == "greyhound":
-                    first_t = getattr(m, "first_race_time_local", None)
-                    rn = getattr(r, "race_no", None)
-                    if isinstance(first_t, time) and isinstance(rn, int) and rn >= 1:
-                        dt_au = datetime.combine(chosen_date, first_t, tzinfo=(mtg_tz_au or now_au.tzinfo)) + per_race_au * (rn - 1)
-                        if app_tz_au:
-                            dt_au = dt_au.astimezone(app_tz_au)
-                        approx_au = True
-                status_au = "unknown"
-                if dt_au is not None:
-                    if now_au < dt_au:
-                        status_au = "upcoming"
-                    elif now_au <= dt_au + per_race_au:
-                        status_au = "in_progress"
-                    else:
-                        status_au = "finished"
-                time_str = (f"~{dt_au.strftime('%H:%M')}" if approx_au and dt_au else (dt_au.strftime("%H:%M") if dt_au else ""))
-                unified_rows.append({
-                    "dt": dt_au,
-                    "country": country,
-                    "code": m_code,
-                    "venue": venue_au,
-                    "race_no": getattr(r, "race_no", None),
-                    "distance": getattr(r, "distance_m", None) or "",
-                    "name": getattr(r, "name", "") or "",
-                    "class": parse_race_class_label(getattr(r, "name", "") or "") if m_code == "thoroughbred" else "",
-                    "status": status_au,
-                    "url": str(getattr(r, "race_url", "") or ""),
-                    "meeting_url": getattr(m, "meeting_url", ""),
-                    "time_disp": time_str,
-                })
-        # Sort by dt ascending (unknown times last).
-        unified_rows.sort(key=lambda x: (x["dt"] is None, x["dt"] or datetime.max.replace(tzinfo=now_au.tzinfo)))
-        # Roster AG Grid inline (same as Race roster dialog, no button needed).
-        render_roster_content(
+    return lookup
+
+
+def main() -> None:
+    init_session_defaults()
+    st.sidebar.title("Dog Rater Live")
+    st.sidebar.caption("Thoroughbred race-day dashboard")
+    pages = ["Race Day", "Race Details", "History", "Model", "Settings"]
+    current = st.session_state.get("nav_page") or "Race Day"
+    if current not in pages:
+        current = "Race Day"
+    page = st.sidebar.radio("Navigate", pages, index=pages.index(current), key="nav_page")
+
+    chosen_date = st.session_state.get("chosen_date") or date.today()
+    if not isinstance(chosen_date, date):
+        chosen_date = date.today()
+        st.session_state.chosen_date = chosen_date
+    code = st.session_state.get("code_label") or "Thoroughbred (All AU)"
+    tz_name = st.session_state.get("tz_name") or "Australia/Sydney"
+    app_tz = resolve_tz(tz_name)
+    now = datetime.now(app_tz)
+
+    need_live = page in ("Race Day", "Race Details", "Model", "Settings")
+    meetings: list = st.session_state.get("meetings") or []
+    fields_by_meeting: dict = st.session_state.get("fields_by_meeting") or {}
+    if need_live:
+        st.session_state.data_status = "loading"
+        try:
+            meetings, fields_by_meeting = ensure_meetings_and_fields(code, chosen_date)
+        except Exception as e:
+            st.session_state.data_status = "error"
+            st.error(f"Could not load race data: {e}")
+            meetings, fields_by_meeting = st.session_state.get("meetings") or [], st.session_state.get("fields_by_meeting") or {}
+
+    saved_picks = []
+    results_by_key = {}
+    try:
+        saved_picks = [p for p in load_picks(chosen_date) if (p.get("code") or "thoroughbred") == "thoroughbred"]
+        raw = db_load_results_for_date(chosen_date)
+        results_by_key = {(mu, int(rn)): row for (mu, rn), row in raw.items()}
+    except Exception:
+        pass
+
+    odds_lookup = _odds_lookup(chosen_date)
+
+    if page == "Race Day":
+        render_race_day(
             chosen_date=chosen_date,
-            code_label=code,
             meetings=meetings,
             fields_by_meeting=fields_by_meeting,
-            open_nonce=0,
+            tz_name=tz_name,
+            now=now,
+            app_tz=app_tz,
+            saved_picks=saved_picks,
+            results_by_key=results_by_key,
+            data_status=str(st.session_state.get("data_status") or "idle"),
+            last_ok=st.session_state.get("last_data_ok_at"),
+            odds_lookup=odds_lookup,
+            sync_fetch=fetch_results_for_meeting,
+            load_results_fn=db_load_results,
+            persist_results_fn=db_persist_results,
+            persist_failure_fn=db_persist_result_failure,
+            get_pick_fn=db_get_pick,
         )
-        st.divider()
-    elif str(code).startswith("Thoroughbred"):
-        # Same race roster + best picks grid as All modes, filtered to thoroughbred only.
-        render_roster_content(
+    elif page == "Race Details":
+        render_race_details(
             chosen_date=chosen_date,
-            code_label=code,
             meetings=meetings,
             fields_by_meeting=fields_by_meeting,
-            open_nonce=0,
+            now=now,
+            app_tz=app_tz,
+            saved_picks=saved_picks,
+            odds_lookup=odds_lookup,
         )
-        st.divider()
-
-    # --- Single-code: Next race banner + venue/race selector + rank flow ---
-    # Thoroughbred uses the roster grid above (with best_pick / if_scratched / roughie).
-    if not _uses_roster_grid:
-        tz_name2 = st.session_state.get("tz_name") or "Australia/Sydney"
-        tz2 = None
-        if tz_name2 and tz_name2 != "Local (server)":
-            try:
-                tz2 = ZoneInfo(tz_name2)
-            except Exception:
-                tz2 = None
-        now2 = datetime.now(tz2).astimezone() if tz2 is not None else datetime.now().astimezone()
-        now2_str = now2.strftime("%H:%M")
-        code_id = (
-            "greyhound" if code == "Greyhounds" or code == "Greyhounds (NZ)"
-            else "thoroughbred" if code.startswith("Thoroughbred")
-            else "harness"
+    elif page == "History":
+        render_history(app_tz=app_tz, default_date=chosen_date)
+    elif page == "Model":
+        render_model(
+            chosen_date=chosen_date,
+            meetings=meetings,
+            fields_by_meeting=fields_by_meeting,
+            now=now,
+            app_tz=app_tz,
         )
-        per_race2 = timedelta(minutes=25 if code_id == "greyhound" else 35 if code_id == "thoroughbred" else 30)
-
-        def _tz_for_tb_meeting(m) -> ZoneInfo | None:
-            try:
-                if getattr(m, "code", "") != "thoroughbred":
-                    return None
-                st_code = (getattr(m, "extra", {}) or {}).get("state") or ""
-                st_code = str(st_code).upper().strip()
-                if st_code in {"NSW", "VIC", "TAS", "ACT"}:
-                    return ZoneInfo("Australia/Sydney")
-                if st_code == "QLD":
-                    return ZoneInfo("Australia/Brisbane")
-                if st_code == "SA":
-                    return ZoneInfo("Australia/Adelaide")
-                if st_code == "NT":
-                    return ZoneInfo("Australia/Darwin")
-                if st_code == "WA":
-                    return ZoneInfo("Australia/Perth")
-            except Exception:
-                return None
-            return None
-
-        best_next: tuple[datetime, str, int | None, bool, str] | None = None  # (dt, venue, race_no, approx, race_url)
-        for m in meetings:
-            mf = fields_by_meeting.get(getattr(m, "meeting_url", ""), {}) or {}
-            races2 = mf.get("races") or []
-            mtg_tz = _tz_for_tb_meeting(m) if code_id == "thoroughbred" else _tz_for_greyhound_meeting(m) if code_id == "greyhound" else None
-            if mtg_tz is None and (getattr(m, "extra", {}) or {}).get("country") == "NZ":
-                mtg_tz = ZoneInfo("Pacific/Auckland")
-            if mtg_tz is None and tz2 is not None:
-                mtg_tz = tz2
-            for r in races2:
-                start_t = getattr(r, "start_time_local", None)
-                dt = None
-                approx = False
-                if isinstance(start_t, time):
-                    dt = datetime.combine(chosen_date, start_t, tzinfo=(mtg_tz or now2.tzinfo))
-                elif code_id == "greyhound":
-                    first_t = getattr(m, "first_race_time_local", None)
-                    rn = getattr(r, "race_no", None)
-                    if isinstance(first_t, time) and isinstance(rn, int) and rn >= 1:
-                        dt = datetime.combine(chosen_date, first_t, tzinfo=(mtg_tz or now2.tzinfo)) + per_race2 * (rn - 1)
-                        approx = True
-
-                if dt is None or dt < now2:
-                    continue
-
-                if best_next is None or dt < best_next[0]:
-                    best_next = (
-                        dt,
-                        getattr(m, "venue", "") or "",
-                        getattr(r, "race_no", None),
-                        approx,
-                        str(getattr(r, "race_url", "") or ""),
-                    )
-
-        if best_next is not None:
-            dt, venue2, race_no2, approx2, _url2 = best_next
-            mins2 = int((dt - now2).total_seconds() // 60)
-            t2 = (f"~{dt.strftime('%H:%M')}" if approx2 else dt.strftime("%H:%M"))
-            approx_note2 = " (approx)" if approx2 else ""
-            rno_disp = f"R{race_no2}" if isinstance(race_no2, int) else "R?"
-            st.success(
-                f"**Next race ({code})**: {venue2} {rno_disp} at {t2} (in ~{mins2} min){approx_note2} — "
-                f"**current time (app):** {now2_str} ({tz_name2})"
-            )
-        else:
-            st.info(f"Next race ({code}): N/A (no upcoming races with known times loaded).")
-
-        with ctrl2:
-            venue_options = ["(select)"] + [m.venue for m in meetings]
-            venue = st.selectbox("Venue", options=venue_options, index=0)
-
-        selected_meeting = next((m for m in meetings if m.venue == venue), None) if venue != "(select)" else None
-        meeting_fields = fields_by_meeting.get(selected_meeting.meeting_url, {}) if selected_meeting else {}
-        races = meeting_fields.get("races", []) if selected_meeting else []
-        meeting_meta = meeting_fields.get("meta", {}) if selected_meeting else {}
-
-        if selected_meeting is not None:
-            st.subheader("Conditions")
-            tc = meeting_meta.get("track_condition")
-            w = meeting_meta.get("weather")
-            pen = meeting_meta.get("penetrometer")
-            if tc or w or pen:
-                st.write(
-                    f"**Track condition:** {tc or 'N/A'}  \n"
-                    f"**Weather:** {w or 'N/A'}  \n"
-                    f"**Penetrometer:** {pen or 'N/A'}"
-                )
-            else:
-                st.caption("Track/weather conditions: N/A for this code/source (v0).")
-
-            with st.expander("External live weather (optional)", expanded=False):
-                st.caption("Pulled from a public weather endpoint (best-effort). Informational only.")
-                snap = cached_venue_weather(selected_meeting.venue)
-                if snap is None:
-                    st.info("No location mapping for this venue yet (v0).")
-                else:
-                    st.write(
-                        f"**Temp:** {snap.temperature_c}°C  \n"
-                        f"**Humidity:** {snap.relative_humidity_pct}%  \n"
-                        f"**Precip:** {snap.precipitation_mm} mm  \n"
-                        f"**Wind:** {snap.wind_speed_kmh} km/h  \n"
-                        f"**Provider:** {snap.provider}"
-                    )
-
-        with ctrl3:
-            race_labels = ["(select)"]
-            for r in races:
-                tm = f" {r.start_time_local.strftime('%H:%M')}" if r.start_time_local else ""
-                race_labels.append(f"R{r.race_no}{tm}")
-            race_label = st.selectbox("Race", options=race_labels, index=0)
-
-        selected_race = None
-        if race_label != "(select)":
-            try:
-                no = int(race_label.split()[0].lstrip("R"))
-                selected_race = next((r for r in races if r.race_no == no), None)
-            except Exception:
-                selected_race = None
-
-        if selected_meeting is not None and selected_race is not None and selected_race.start_time_local is not None:
-            rws = cached_race_weather(selected_meeting.venue, selected_meeting.meeting_date, selected_race.start_time_local)
-            if rws is not None:
-                st.caption(
-                    f"Race-time weather (approx): precip={rws.precipitation_mm}mm, wind={rws.wind_speed_kmh}km/h, humidity={rws.relative_humidity_pct}% (Open‑Meteo)"
-                )
-
-        st.subheader("Scoring controls")
-        w1, w2, w3, w4 = st.columns([1, 1, 1, 1], vertical_alignment="center")
-        with w1:
-            auto_weights = st.toggle("Auto (AI) weights", value=True)
-            box_w = st.slider("Box / draw weight", 0.0, 1.0, 0.33, 0.01, disabled=auto_weights)
-        with w2:
-            form_w = st.slider("Recent form weight", 0.0, 1.0, 0.34, 0.01, disabled=auto_weights)
-        with w3:
-            early_w = st.slider("Early speed / class proxy weight", 0.0, 1.0, 0.33, 0.01, disabled=auto_weights)
-        with w4:
-            explain_mode = st.toggle("Explain mode (detailed)", value=False)
-            show_debug = st.toggle("Show debug info", value=False)
-
-        bw, fw, ew = normalize_weights(box_w, form_w, early_w)
-        st.caption(f"Normalized weights: draw={bw:.2f}, form={fw:.2f}, proxy={ew:.2f}")
-
-        st.subheader("Action")
-        rank = st.button("Rank Runners", disabled=(selected_race is None))
-
-        if rank and selected_race is not None:
-            try:
-                if code == "Greyhounds":
-                    runners = cached_dog_runners(selected_race.race_url)
-                else:
-                    runners_by = meeting_fields.get("runners_by_race") or {}
-                    runners = runners_by.get(selected_race.race_no, [])
-
-                if auto_weights:
-                    # Use per-race forecast if possible; otherwise current.
-                    wx = None
-                    if selected_meeting is not None and selected_race is not None:
-                        wx = cached_race_weather(selected_meeting.venue, selected_meeting.meeting_date, selected_race.start_time_local)
-                    bw, fw, ew, rationale = suggest_auto_weights(
-                        runners,
-                        weather=wx,
-                        track_condition=meeting_meta.get("track_condition") if code.startswith("Thoroughbred") else None,
-                    )
-                    if show_debug:
-                        st.write("**Auto-weight rationale**")
-                        for line in rationale:
-                            st.write(f"- {line}")
-
-                ranked = rank_runners(
-                    runners,
-                    box_weight=bw if auto_weights else box_w,
-                    form_weight=fw if auto_weights else form_w,
-                    early_weight=ew if auto_weights else early_w,
-                    weather=(
-                        cached_race_weather(selected_meeting.venue, selected_meeting.meeting_date, selected_race.start_time_local)
-                        if selected_meeting is not None and selected_race is not None
-                        else None
-                    ),
-                    track_condition=meeting_meta.get("track_condition") if code.startswith("Thoroughbred") else None,
-                    explain_mode="detailed" if explain_mode else "short",
-                )
-            except Exception as e:
-                st.error(f"Could not rank runners: {e}")
-                return
-
-            # Save context for optional journaling
-            st.session_state.last_rank_context = {
-                "code_label": code,
-                "code": ("greyhound" if code == "Greyhounds" else "thoroughbred" if code.startswith("Thoroughbred") else "harness"),
-                "chosen_date": chosen_date,
-                "selected_meeting": selected_meeting,
-                "selected_race": selected_race,
-                "meeting_meta": meeting_meta,
-                "auto_weights": auto_weights,
-                "weights_used": {
-                    "draw": float(bw if auto_weights else box_w),
-                    "form": float(fw if auto_weights else form_w),
-                    "proxy": float(ew if auto_weights else early_w),
-                },
-            }
-            st.session_state.last_rank_outputs = {"ranked": ranked, "runners": runners}
-
-            st.subheader("Ranked runners")
-            rows = []
-            # Fast lookup for extra runner fields (e.g. age/sex for thoroughbreds)
-            runner_by_name = {getattr(x, "name", ""): x for x in (runners or []) if getattr(x, "name", "")}
-            if code.startswith("Thoroughbred"):
-                silk_bits = []
-                for rr in ranked:
-                    r0 = runner_by_name.get(rr.name)
-                    silk = str(getattr(r0, "silk_url", None) or "") if r0 is not None else ""
-                    if silk:
-                        silk_bits.append(
-                            f'<span style="display:inline-flex;align-items:center;gap:4px;margin:2px 10px 2px 0;">'
-                            f'<img src="{html.escape(silk)}" height="24" referrerpolicy="no-referrer" />'
-                            f'<span>{rr.rank}. {html.escape(rr.name)}</span></span>'
-                        )
-                if silk_bits:
-                    st.markdown(
-                        '<div style="line-height:1.8;">' + "".join(silk_bits) + "</div>",
-                        unsafe_allow_html=True,
-                    )
-            for rr in ranked:
-                r0 = runner_by_name.get(rr.name)
-                age = getattr(r0, "age", None) if r0 is not None else None
-                rows.append(
-                    {
-                        "rank": rr.rank,
-                        ("dog name" if code == "Greyhounds" else "runner"): rr.name,
-                        **({"age": age} if code.startswith("Thoroughbred") else {}),
-                        ("box" if code == "Greyhounds" else rr.draw_label): rr.draw,
-                        "score": round(rr.score, 3),
-                        "short key factors": rr.key_factors,
-                    }
-                )
-            st.dataframe(rows, width="stretch", hide_index=True)
-
-            save_pick = st.button("Save pick to Daily review", disabled=(selected_meeting is None))
-            if save_pick and selected_meeting is not None:
-                try:
-                    top = ranked[0] if ranked else None
-                    if top is None:
-                        raise RuntimeError("No ranked runners to save.")
-
-                    # Best-effort: capture some history bullets for the top pick.
-                    r_obj = next((r for r in runners if getattr(r, "name", None) == top.name), None)
-                    hist: list[str] = []
-                    if r_obj is not None:
-                        if getattr(r_obj, "code", None) == "thoroughbred" and getattr(r_obj, "profile_url", None):
-                            hist = cached_tb_history(r_obj.profile_url)
-                        else:
-                            hist = history_bullets_for_runner(r_obj)
-
-                    wx = None
-                    if selected_race.start_time_local is not None:
-                        wx = cached_race_weather(selected_meeting.venue, selected_meeting.meeting_date, selected_race.start_time_local)
-
-                    entry = make_pick_entry(
-                        meeting_date=selected_meeting.meeting_date,
-                        code=("greyhound" if code == "Greyhounds" else "thoroughbred" if code.startswith("Thoroughbred") else "harness"),
-                        venue=selected_meeting.venue,
-                        meeting_url=selected_meeting.meeting_url,
-                        race_no=int(selected_race.race_no),
-                        race_name=getattr(selected_race, "name", f"Race {selected_race.race_no}") or f"Race {selected_race.race_no}",
-                        race_url=selected_race.race_url,
-                        pick_name=top.name,
-                        pick_draw=top.draw,
-                        pick_score=float(top.score),
-                        key_factors=top.key_factors,
-                        why_bullets=list(top.why_bullets),
-                        history_bullets=hist[:12],
-                        weights={
-                            "auto_weights": bool(auto_weights),
-                            "draw_weight": float(bw if auto_weights else box_w),
-                            "form_weight": float(fw if auto_weights else form_w),
-                            "proxy_weight": float(ew if auto_weights else early_w),
-                        },
-                        conditions={
-                            "track_condition": meeting_meta.get("track_condition"),
-                            "meeting_weather": meeting_meta.get("weather"),
-                            "penetrometer": meeting_meta.get("penetrometer"),
-                            "race_weather": (wx.__dict__ if wx is not None else None),
-                        },
-                    )
-                    upsert_pick(entry)
-                    db_save_pick(
-                        date.fromisoformat(entry.meeting_date),
-                        entry.meeting_url,
-                        entry.code,
-                        entry.race_no,
-                        entry.venue,
-                        entry.race_name or f"R{entry.race_no}",
-                        entry.pick_name,
-                        backup="",
-                        pick_data=asdict(entry),
-                    )
-                    st.success("Saved. Open 'Daily review' to see winner vs pick once results are posted.")
-                except Exception as e:
-                    st.error(f"Could not save pick: {e}")
-
-            top_n = min(5, len(ranked))
-            st.subheader(f"Why this could win (top {top_n})")
-            for rr in ranked[:top_n]:
-                with st.expander(f"#{rr.rank} {rr.name} (score {rr.score:.3f})", expanded=(rr.rank == 1)):
-                    for b in rr.why_bullets:
-                        st.write(f"- {b}")
-
-                    # Historical/contextual bullets (best-effort).
-                    if explain_mode:
-                        r_obj = next((r for r in runners if getattr(r, "name", None) == rr.name), None)
-                        hist: list[str] = []
-                        if r_obj is not None:
-                            if getattr(r_obj, "code", None) == "thoroughbred" and getattr(r_obj, "profile_url", None):
-                                hist = cached_tb_history(r_obj.profile_url)
-                            else:
-                                hist = history_bullets_for_runner(r_obj)
-                        if hist:
-                            st.write("**History / form snippets**")
-                            for h in hist[:8]:
-                                st.write(f"- {h}")
-                    if show_debug:
-                        st.write("**Debug**")
-                        st.json(rr.debug)
+    else:
+        render_settings(
+            chosen_date=chosen_date,
+            render_full_roster=render_roster_content,
+            meetings=meetings,
+            fields_by_meeting=fields_by_meeting,
+            code_label=code,
+        )
 
 
 if __name__ == "__main__":
     main()
-

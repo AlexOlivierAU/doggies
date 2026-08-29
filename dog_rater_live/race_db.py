@@ -58,28 +58,67 @@ def _conn(db_path: Path = _DEFAULT_DB) -> sqlite3.Connection:
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_jockey_rides_key ON jockey_rides (jockey_key, code, date)"
     )
-    _migrate_picks_columns(c)
+    migrate_schema(c)
     return c
 
 
-def _migrate_picks_columns(conn: sqlite3.Connection) -> None:
-    """Add tracking columns to picks if missing (safe to re-run)."""
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(picks)")}
-    for col, decl in (
-        ("roughie", "TEXT"),
-        ("best_score", "REAL"),
-        ("backup_score", "REAL"),
-        ("roughie_score", "REAL"),
-        ("field_size", "INTEGER"),
-        ("status", "TEXT"),
-        ("just_place", "TEXT"),
-        ("just_place_score", "REAL"),
-    ):
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Idempotent SQLite migrations. Safe on empty DBs and existing race-day data."""
+    _migrate_picks_columns(conn)
+    _migrate_results_columns(conn)
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for col, decl in columns:
         if col not in existing:
             try:
-                conn.execute(f"ALTER TABLE picks ADD COLUMN {col} {decl}")
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             except Exception:
                 pass
+
+
+def _migrate_picks_columns(conn: sqlite3.Connection) -> None:
+    """Add tracking / snapshot columns to picks if missing (safe to re-run)."""
+    _add_columns(
+        conn,
+        "picks",
+        (
+            ("roughie", "TEXT"),
+            ("best_score", "REAL"),
+            ("backup_score", "REAL"),
+            ("roughie_score", "REAL"),
+            ("field_size", "INTEGER"),
+            ("status", "TEXT"),
+            ("just_place", "TEXT"),
+            ("just_place_score", "REAL"),
+            ("locked", "INTEGER"),
+            ("locked_at", "REAL"),
+            ("confidence_label", "TEXT"),
+            ("score_gap", "REAL"),
+            ("primary_odds", "REAL"),
+            ("backup_odds", "REAL"),
+            ("original_primary", "TEXT"),
+            ("primary_scratched", "INTEGER"),
+            ("backup_promoted", "INTEGER"),
+            ("scheduled_jump", "TEXT"),
+        ),
+    )
+
+
+def _migrate_results_columns(conn: sqlite3.Connection) -> None:
+    _add_columns(
+        conn,
+        "results",
+        (
+            ("status", "TEXT"),
+            ("error_message", "TEXT"),
+        ),
+    )
 
 
 _JOCKEY_CLAIM_RE = re.compile(
@@ -302,6 +341,145 @@ def update_race_runners_in_db(
 # --- Picks (best_pick, backup, optional full payload) ---
 
 
+_PICK_SELECT = """
+    date, meeting_url, code, race_no, venue, race_label, best_pick, backup,
+    pick_data, saved_at, roughie, best_score, backup_score, roughie_score,
+    field_size, status, just_place, just_place_score,
+    locked, locked_at, confidence_label, score_gap, primary_odds, backup_odds,
+    original_primary, primary_scratched, backup_promoted, scheduled_jump
+"""
+
+
+def _row_to_pick(r: tuple) -> dict:
+    (
+        dt,
+        mu,
+        code,
+        rn,
+        venue,
+        race_label,
+        best_pick,
+        backup,
+        pick_data_blob,
+        saved_at,
+        roughie,
+        best_score,
+        backup_score,
+        roughie_score,
+        field_size,
+        status,
+        just_place,
+        just_place_score,
+        locked,
+        locked_at,
+        confidence_label,
+        score_gap,
+        primary_odds,
+        backup_odds,
+        original_primary,
+        primary_scratched,
+        backup_promoted,
+        scheduled_jump,
+    ) = r
+    extra = {
+        "locked": bool(locked),
+        "locked_at": locked_at,
+        "confidence_label": confidence_label or "",
+        "score_gap": score_gap,
+        "primary_odds": primary_odds,
+        "backup_odds": backup_odds,
+        "original_primary": original_primary or "",
+        "primary_scratched": bool(primary_scratched),
+        "backup_promoted": bool(backup_promoted),
+        "scheduled_jump": scheduled_jump or "",
+        "saved_at": saved_at,
+        "roughie": roughie or "",
+        "just_place": just_place or "",
+        "field_size": field_size,
+        "status": status or "",
+    }
+    if pick_data_blob:
+        try:
+            obj = json.loads(pick_data_blob.decode("utf-8"))
+            obj.setdefault("meeting_url", mu)
+            obj.setdefault("race_no", rn)
+            obj.setdefault("code", code)
+            obj.setdefault("venue", venue)
+            obj.setdefault("meeting_date", dt)
+            obj.setdefault("pick_name", best_pick)
+            obj.setdefault("backup", backup or "")
+            obj.setdefault("roughie", roughie or "")
+            obj.setdefault("just_place", just_place or "")
+            obj.setdefault("race_label", race_label or f"R{rn}")
+            if best_score is not None:
+                obj.setdefault("pick_score", best_score)
+            cond = obj.setdefault("conditions", {})
+            if isinstance(cond, dict):
+                if backup_score is not None:
+                    cond.setdefault("backup_score", backup_score)
+                if roughie_score is not None:
+                    cond.setdefault("roughie_score", roughie_score)
+                if just_place_score is not None:
+                    cond.setdefault("just_place_score", just_place_score)
+                if field_size is not None:
+                    cond.setdefault("field_size", field_size)
+                if status:
+                    cond.setdefault("status", status)
+                if just_place:
+                    cond.setdefault("just_place", just_place)
+            obj.update(extra)
+            return obj
+        except Exception:
+            pass
+    return {
+        "meeting_date": dt,
+        "meeting_url": mu,
+        "code": code,
+        "venue": venue or "",
+        "race_no": rn,
+        "race_label": race_label or f"R{rn}",
+        "pick_name": best_pick or "",
+        "backup": backup or "",
+        "roughie": roughie or "",
+        "just_place": just_place or "",
+        "pick_score": best_score,
+        "picked_at_iso": "",
+        "key_factors": "",
+        "why_bullets": [],
+        "history_bullets": [],
+        "weights": {},
+        "conditions": {
+            "backup_score": backup_score,
+            "roughie_score": roughie_score,
+            "just_place_score": just_place_score,
+            "field_size": field_size,
+            "status": status or "",
+            "just_place": just_place or "",
+        },
+        **extra,
+    }
+
+
+def get_pick(
+    d: date,
+    meeting_url: str,
+    race_no: int,
+    db_path: Path = _DEFAULT_DB,
+) -> Optional[dict]:
+    try:
+        conn = _conn(db_path)
+        row = conn.execute(
+            f"SELECT {_PICK_SELECT} FROM picks WHERE date = ? AND meeting_url = ? AND race_no = ?",
+            (d.isoformat(), meeting_url, int(race_no)),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        return _row_to_pick(row)
+    except Exception:
+        return None
+
+
 def save_pick(
     d: date,
     meeting_url: str,
@@ -321,15 +499,35 @@ def save_pick(
     status: str = "",
     just_place: str = "",
     just_place_score: Optional[float] = None,
+    locked: Optional[bool] = None,
+    locked_at: Optional[float] = None,
+    confidence_label: str = "",
+    score_gap: Optional[float] = None,
+    primary_odds: Optional[float] = None,
+    backup_odds: Optional[float] = None,
+    original_primary: str = "",
+    primary_scratched: Optional[bool] = None,
+    backup_promoted: Optional[bool] = None,
+    scheduled_jump: str = "",
+    force: bool = False,
     db_path: Path = _DEFAULT_DB,
-) -> None:
-    """Upsert a pick for (date, meeting_url, race_no). pick_data = full journal-style dict (JSON)."""
+) -> bool:
+    """Upsert a pick for (date, meeting_url, race_no). Returns False if a locked snapshot blocked the write."""
     try:
         conn = _conn(db_path)
+        existing = conn.execute(
+            f"SELECT {_PICK_SELECT} FROM picks WHERE date = ? AND meeting_url = ? AND race_no = ?",
+            (d.isoformat(), meeting_url, int(race_no)),
+        ).fetchone()
+        existing_pick = _row_to_pick(existing) if existing else None
+        if existing_pick and existing_pick.get("locked") and not force:
+            conn.close()
+            return False
+
         blob = json.dumps(pick_data, ensure_ascii=False).encode("utf-8") if pick_data else None
-        # Prefer explicit args; fall back to pick_data / conditions when omitted.
         if pick_data:
             cond = pick_data.get("conditions") or {}
+            snap = pick_data.get("snapshot") or {}
             if not roughie:
                 roughie = str(cond.get("roughie") or pick_data.get("roughie") or "")
             if not just_place:
@@ -361,12 +559,60 @@ def save_pick(
                     pass
             if not status:
                 status = str(cond.get("status") or pick_data.get("status") or "")
+            if not confidence_label:
+                confidence_label = str(snap.get("confidence_label") or pick_data.get("confidence_label") or "")
+            if score_gap is None and snap.get("score_gap") is not None:
+                try:
+                    score_gap = float(snap.get("score_gap"))
+                except (TypeError, ValueError):
+                    pass
+            if primary_odds is None and snap.get("primary_odds") is not None:
+                try:
+                    primary_odds = float(snap.get("primary_odds"))
+                except (TypeError, ValueError):
+                    pass
+            if backup_odds is None and snap.get("backup_odds") is not None:
+                try:
+                    backup_odds = float(snap.get("backup_odds"))
+                except (TypeError, ValueError):
+                    pass
+            if not scheduled_jump:
+                scheduled_jump = str(snap.get("scheduled_jump") or pick_data.get("scheduled_jump") or "")
+            if not original_primary:
+                original_primary = str(snap.get("original_primary") or pick_data.get("original_primary") or "")
+
+        if existing_pick:
+            if locked is None:
+                locked = bool(existing_pick.get("locked"))
+            if locked_at is None:
+                locked_at = existing_pick.get("locked_at")
+            if not original_primary:
+                original_primary = existing_pick.get("original_primary") or ""
+            if primary_scratched is None:
+                primary_scratched = bool(existing_pick.get("primary_scratched"))
+            if backup_promoted is None:
+                backup_promoted = bool(existing_pick.get("backup_promoted"))
+            if not blob and existing[8]:
+                blob = existing[8]
+            if primary_odds is None:
+                primary_odds = existing_pick.get("primary_odds")
+            if backup_odds is None:
+                backup_odds = existing_pick.get("backup_odds")
+            if score_gap is None:
+                score_gap = existing_pick.get("score_gap")
+            if not confidence_label:
+                confidence_label = existing_pick.get("confidence_label") or ""
+            if not scheduled_jump:
+                scheduled_jump = existing_pick.get("scheduled_jump") or ""
+
         conn.execute(
             """INSERT OR REPLACE INTO picks
                (date, meeting_url, code, race_no, venue, race_label, best_pick, backup,
                 pick_data, saved_at, roughie, best_score, backup_score, roughie_score,
-                field_size, status, just_place, just_place_score)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                field_size, status, just_place, just_place_score,
+                locked, locked_at, confidence_label, score_gap, primary_odds, backup_odds,
+                original_primary, primary_scratched, backup_promoted, scheduled_jump)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 d.isoformat(),
                 meeting_url,
@@ -386,12 +632,77 @@ def save_pick(
                 status or "",
                 just_place or "",
                 just_place_score,
+                1 if locked else 0,
+                locked_at,
+                confidence_label or "",
+                score_gap,
+                primary_odds,
+                backup_odds,
+                original_primary or "",
+                1 if primary_scratched else 0,
+                1 if backup_promoted else 0,
+                scheduled_jump or "",
             ),
         )
         conn.commit()
         conn.close()
+        return True
     except Exception:
-        pass
+        return False
+
+
+def lock_pick(
+    d: date,
+    meeting_url: str,
+    race_no: int,
+    db_path: Path = _DEFAULT_DB,
+) -> bool:
+    try:
+        conn = _conn(db_path)
+        conn.execute(
+            """UPDATE picks SET locked = 1, locked_at = COALESCE(locked_at, ?)
+               WHERE date = ? AND meeting_url = ? AND race_no = ?""",
+            (time.time(), d.isoformat(), meeting_url, int(race_no)),
+        )
+        conn.commit()
+        changed = conn.total_changes > 0
+        conn.close()
+        return changed
+    except Exception:
+        return False
+
+
+def mark_primary_scratched(
+    d: date,
+    meeting_url: str,
+    race_no: int,
+    db_path: Path = _DEFAULT_DB,
+) -> bool:
+    """Preserve original primary and record that the backup was promoted."""
+    try:
+        conn = _conn(db_path)
+        row = conn.execute(
+            "SELECT best_pick, original_primary, backup FROM picks WHERE date = ? AND meeting_url = ? AND race_no = ?",
+            (d.isoformat(), meeting_url, int(race_no)),
+        ).fetchone()
+        if row is None:
+            conn.close()
+            return False
+        best_pick, original_primary, backup = row
+        preserved = (original_primary or "").strip() or (best_pick or "")
+        conn.execute(
+            """UPDATE picks
+               SET primary_scratched = 1,
+                   backup_promoted = CASE WHEN ? != '' THEN 1 ELSE backup_promoted END,
+                   original_primary = ?
+               WHERE date = ? AND meeting_url = ? AND race_no = ?""",
+            (backup or "", preserved, d.isoformat(), meeting_url, int(race_no)),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
 
 
 def load_picks(
@@ -404,102 +715,36 @@ def load_picks(
         conn = _conn(db_path)
         if meeting_url:
             rows = conn.execute(
-                """SELECT date, meeting_url, code, race_no, venue, race_label, best_pick, backup,
-                          pick_data, saved_at, roughie, best_score, backup_score, roughie_score,
-                          field_size, status, just_place, just_place_score
-                   FROM picks WHERE date = ? AND meeting_url = ? ORDER BY race_no""",
+                f"SELECT {_PICK_SELECT} FROM picks WHERE date = ? AND meeting_url = ? ORDER BY race_no",
                 (d.isoformat(), meeting_url),
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT date, meeting_url, code, race_no, venue, race_label, best_pick, backup,
-                          pick_data, saved_at, roughie, best_score, backup_score, roughie_score,
-                          field_size, status, just_place, just_place_score
-                   FROM picks WHERE date = ? ORDER BY meeting_url, race_no""",
+                f"SELECT {_PICK_SELECT} FROM picks WHERE date = ? ORDER BY meeting_url, race_no",
                 (d.isoformat(),),
             ).fetchall()
         conn.close()
-        out = []
-        for r in rows:
-            (
-                dt,
-                mu,
-                code,
-                rn,
-                venue,
-                race_label,
-                best_pick,
-                backup,
-                pick_data_blob,
-                _,
-                roughie,
-                best_score,
-                backup_score,
-                roughie_score,
-                field_size,
-                status,
-                just_place,
-                just_place_score,
-            ) = r
-            if pick_data_blob:
-                try:
-                    obj = json.loads(pick_data_blob.decode("utf-8"))
-                    obj.setdefault("meeting_url", mu)
-                    obj.setdefault("race_no", rn)
-                    obj.setdefault("code", code)
-                    obj.setdefault("venue", venue)
-                    obj.setdefault("meeting_date", dt)
-                    obj.setdefault("pick_name", best_pick)
-                    obj.setdefault("backup", backup or "")
-                    obj.setdefault("roughie", roughie or "")
-                    obj.setdefault("just_place", just_place or "")
-                    if best_score is not None:
-                        obj.setdefault("pick_score", best_score)
-                    cond = obj.setdefault("conditions", {})
-                    if isinstance(cond, dict):
-                        if backup_score is not None:
-                            cond.setdefault("backup_score", backup_score)
-                        if roughie_score is not None:
-                            cond.setdefault("roughie_score", roughie_score)
-                        if just_place_score is not None:
-                            cond.setdefault("just_place_score", just_place_score)
-                        if field_size is not None:
-                            cond.setdefault("field_size", field_size)
-                        if status:
-                            cond.setdefault("status", status)
-                        if just_place:
-                            cond.setdefault("just_place", just_place)
-                    out.append(obj)
-                    continue
-                except Exception:
-                    pass
-            out.append({
-                "meeting_date": dt,
-                "meeting_url": mu,
-                "code": code,
-                "venue": venue or "",
-                "race_no": rn,
-                "race_label": race_label or f"R{rn}",
-                "pick_name": best_pick or "",
-                "backup": backup or "",
-                "roughie": roughie or "",
-                "just_place": just_place or "",
-                "pick_score": best_score,
-                "picked_at_iso": "",
-                "key_factors": "",
-                "why_bullets": [],
-                "history_bullets": [],
-                "weights": {},
-                "conditions": {
-                    "backup_score": backup_score,
-                    "roughie_score": roughie_score,
-                    "just_place_score": just_place_score,
-                    "field_size": field_size,
-                    "status": status or "",
-                    "just_place": just_place or "",
-                },
-            })
-        return out
+        return [_row_to_pick(r) for r in rows]
+    except Exception:
+        return []
+
+
+def load_picks_range(
+    date_from: date,
+    date_to: date,
+    db_path: Path = _DEFAULT_DB,
+) -> list[dict]:
+    """Load picks inclusive of date_from..date_to."""
+    try:
+        conn = _conn(db_path)
+        rows = conn.execute(
+            f"""SELECT {_PICK_SELECT} FROM picks
+                WHERE date >= ? AND date <= ?
+                ORDER BY date, meeting_url, race_no""",
+            (date_from.isoformat(), date_to.isoformat()),
+        ).fetchall()
+        conn.close()
+        return [_row_to_pick(r) for r in rows]
     except Exception:
         return []
 
@@ -519,15 +764,86 @@ def persist_results(
         conn = _conn(db_path)
         for race_no, res in (results_by_race or {}).items():
             winner = getattr(res, "winner", None) or (res.get("winner") if isinstance(res, dict) else None)
-            places = getattr(res, "places", ()) or (res.get("places") if isinstance(res, dict) else ())
+            places = getattr(res, "places", None)
+            if places is None and isinstance(res, dict):
+                places = res.get("places")
+            if not places:
+                places = ()
             place2 = places[1] if len(places) > 1 else (res.get("place2") if isinstance(res, dict) else None)
             place3 = places[2] if len(places) > 2 else (res.get("place3") if isinstance(res, dict) else None)
             src = getattr(res, "source_url", None) or (res.get("source_url") if isinstance(res, dict) else None)
+            row_status = ""
+            err = ""
+            if isinstance(res, dict):
+                row_status = str(res.get("status") or "")
+                err = str(res.get("error_message") or res.get("error") or "")
+            if not row_status:
+                row_status = "ok" if winner else "empty"
             conn.execute(
-                """INSERT OR REPLACE INTO results (date, meeting_url, code, race_no, winner, place2, place3, source_url, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (d.isoformat(), meeting_url, code, race_no, winner or "", place2 or "", place3 or "", src or "", time.time()),
+                """INSERT OR REPLACE INTO results
+                   (date, meeting_url, code, race_no, winner, place2, place3, source_url, fetched_at, status, error_message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    d.isoformat(),
+                    meeting_url,
+                    code,
+                    race_no,
+                    winner or "",
+                    place2 or "",
+                    place3 or "",
+                    src or "",
+                    time.time(),
+                    row_status,
+                    err,
+                ),
             )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    # Best-effort: join fields + results into jockey ride ledger.
+    try:
+        sync_jockey_rides_for_meeting(d, meeting_url, code, db_path=db_path)
+    except Exception:
+        pass
+
+
+def persist_result_failure(
+    d: date,
+    meeting_url: str,
+    code: str,
+    race_no: int,
+    error_message: str,
+    db_path: Path = _DEFAULT_DB,
+) -> None:
+    try:
+        conn = _conn(db_path)
+        existing = conn.execute(
+            "SELECT winner, place2, place3, source_url FROM results WHERE date = ? AND meeting_url = ? AND race_no = ?",
+            (d.isoformat(), meeting_url, int(race_no)),
+        ).fetchone()
+        winner = existing[0] if existing else ""
+        place2 = existing[1] if existing else ""
+        place3 = existing[2] if existing else ""
+        src = existing[3] if existing else ""
+        conn.execute(
+            """INSERT OR REPLACE INTO results
+               (date, meeting_url, code, race_no, winner, place2, place3, source_url, fetched_at, status, error_message)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                d.isoformat(),
+                meeting_url,
+                code,
+                int(race_no),
+                winner or "",
+                place2 or "",
+                place3 or "",
+                src or "",
+                time.time(),
+                "error",
+                error_message or "result fetch failed",
+            ),
+        )
         conn.commit()
         conn.close()
     except Exception:
@@ -549,11 +865,73 @@ def load_results(
     try:
         conn = _conn(db_path)
         rows = conn.execute(
-            "SELECT race_no, winner, place2, place3 FROM results WHERE date = ? AND meeting_url = ? AND code = ?",
+            "SELECT race_no, winner, place2, place3, status, error_message, source_url FROM results WHERE date = ? AND meeting_url = ? AND code = ?",
             (d.isoformat(), meeting_url, code),
         ).fetchall()
         conn.close()
-        return {r[0]: {"winner": r[1] or "", "place2": r[2] or "", "place3": r[3] or ""} for r in rows}
+        return {
+            r[0]: {
+                "winner": r[1] or "",
+                "place2": r[2] or "",
+                "place3": r[3] or "",
+                "status": r[4] or "",
+                "error_message": r[5] or "",
+                "source_url": r[6] or "",
+            }
+            for r in rows
+        }
+    except Exception:
+        return {}
+
+
+def load_results_for_date(d: date, db_path: Path = _DEFAULT_DB) -> dict[tuple[str, int], dict]:
+    """All stored results for a date, keyed by (meeting_url, race_no)."""
+    try:
+        conn = _conn(db_path)
+        rows = conn.execute(
+            """SELECT meeting_url, race_no, winner, place2, place3, status, error_message, source_url, code
+               FROM results WHERE date = ?""",
+            (d.isoformat(),),
+        ).fetchall()
+        conn.close()
+        return {
+            (r[0], int(r[1])): {
+                "winner": r[2] or "",
+                "place2": r[3] or "",
+                "place3": r[4] or "",
+                "status": r[5] or "",
+                "error_message": r[6] or "",
+                "source_url": r[7] or "",
+                "code": r[8] or "",
+            }
+            for r in rows
+        }
+    except Exception:
+        return {}
+
+
+def load_results_range(date_from: date, date_to: date, db_path: Path = _DEFAULT_DB) -> dict[tuple[str, str, int], dict]:
+    """Results keyed by (date, meeting_url, race_no)."""
+    try:
+        conn = _conn(db_path)
+        rows = conn.execute(
+            """SELECT date, meeting_url, race_no, winner, place2, place3, status, error_message, source_url, code
+               FROM results WHERE date >= ? AND date <= ?""",
+            (date_from.isoformat(), date_to.isoformat()),
+        ).fetchall()
+        conn.close()
+        return {
+            (r[0], r[1], int(r[2])): {
+                "winner": r[3] or "",
+                "place2": r[4] or "",
+                "place3": r[5] or "",
+                "status": r[6] or "",
+                "error_message": r[7] or "",
+                "source_url": r[8] or "",
+                "code": r[9] or "",
+            }
+            for r in rows
+        }
     except Exception:
         return {}
 

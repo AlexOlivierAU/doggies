@@ -1,0 +1,230 @@
+"""Immutable pick snapshots.
+
+Once a pick is locked (user confirm, or automatically at/near jump), later live
+rankings must not overwrite the stored primary/backup/scores/odds/weights.
+A primary scratching updates flags only — the original pick name is preserved.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional
+
+from journal import make_pick_entry
+from race_db import (
+    _DEFAULT_DB,
+    get_pick,
+    lock_pick,
+    mark_primary_scratched,
+    save_pick,
+)
+from services.confidence import confidence_from_scores
+
+LOCK_BEFORE_JUMP = timedelta(minutes=2)
+
+
+def _as_date(d: date | str) -> date:
+    if isinstance(d, date):
+        return d
+    return date.fromisoformat(str(d)[:10])
+
+
+def build_snapshot_payload(
+    *,
+    meeting_date: date,
+    code: str,
+    venue: str,
+    meeting_url: str,
+    race_no: int,
+    race_name: str,
+    race_url: str,
+    primary: str,
+    backup: str,
+    primary_score: Optional[float],
+    backup_score: Optional[float],
+    primary_draw: Optional[int] = None,
+    key_factors: str = "",
+    why_bullets: Optional[list[str]] = None,
+    weights: Optional[dict[str, Any]] = None,
+    field: Optional[list[dict[str, Any]]] = None,
+    scratching_state: Optional[list[dict[str, Any]]] = None,
+    primary_odds: Optional[float] = None,
+    backup_odds: Optional[float] = None,
+    scheduled_jump: str = "",
+    track_condition: str = "",
+    status: str = "",
+    field_size: Optional[int] = None,
+) -> dict[str, Any]:
+    gap, label = confidence_from_scores(primary_score, backup_score)
+    entry = make_pick_entry(
+        meeting_date=meeting_date,
+        code=code,
+        venue=venue,
+        meeting_url=meeting_url,
+        race_no=int(race_no),
+        race_name=race_name or f"R{race_no}",
+        race_url=race_url or "",
+        pick_name=primary,
+        pick_draw=primary_draw,
+        pick_score=float(primary_score or 0.0),
+        key_factors=key_factors or "",
+        why_bullets=list(why_bullets or [])[:8],
+        history_bullets=[],
+        weights=weights or {},
+        conditions={
+            "backup": backup,
+            "backup_score": backup_score,
+            "field_size": field_size,
+            "status": status,
+            "track_condition": track_condition,
+            "scheduled_jump": scheduled_jump,
+        },
+    )
+    payload = dict(entry.__dict__)
+    payload["backup"] = backup or ""
+    payload["snapshot"] = {
+        "confidence_label": label,
+        "score_gap": gap,
+        "primary_odds": primary_odds,
+        "backup_odds": backup_odds,
+        "scheduled_jump": scheduled_jump,
+        "field": list(field or []),
+        "scratching_state": list(scratching_state or []),
+        "weights": weights or {},
+        "captured_at": entry.picked_at_iso,
+    }
+    payload["confidence_label"] = label
+    payload["score_gap"] = gap
+    payload["scheduled_jump"] = scheduled_jump
+    return payload
+
+
+def save_selection_snapshot(
+    *,
+    meeting_date: date | str,
+    meeting_url: str,
+    code: str,
+    race_no: int,
+    venue: str,
+    race_label: str,
+    primary: str,
+    backup: str = "",
+    pick_data: Optional[dict[str, Any]] = None,
+    best_score: Optional[float] = None,
+    backup_score: Optional[float] = None,
+    field_size: Optional[int] = None,
+    status: str = "",
+    confidence_label: str = "",
+    score_gap: Optional[float] = None,
+    primary_odds: Optional[float] = None,
+    backup_odds: Optional[float] = None,
+    scheduled_jump: str = "",
+    lock: bool = False,
+    db_path: Path = _DEFAULT_DB,
+) -> bool:
+    """Write a snapshot. No-op (returns False) if an existing row is locked."""
+    d = _as_date(meeting_date)
+    existing = get_pick(d, meeting_url, int(race_no), db_path=db_path)
+    if existing and existing.get("locked") and not lock:
+        return False
+    if existing and existing.get("locked"):
+        # Confirm/lock of an already-saved snapshot: lock only, do not rewrite.
+        return lock_pick(d, meeting_url, int(race_no), db_path=db_path)
+
+    snap = (pick_data or {}).get("snapshot") or {}
+    if not confidence_label:
+        if score_gap is None:
+            score_gap, confidence_label = confidence_from_scores(best_score, backup_score)
+        else:
+            from services.confidence import confidence_label as _lab
+
+            confidence_label = _lab(score_gap)
+    return save_pick(
+        d,
+        meeting_url,
+        code,
+        int(race_no),
+        venue,
+        race_label or f"R{race_no}",
+        primary,
+        backup=backup,
+        pick_data=pick_data,
+        best_score=best_score,
+        backup_score=backup_score,
+        field_size=field_size,
+        status=status,
+        confidence_label=confidence_label or str(snap.get("confidence_label") or ""),
+        score_gap=score_gap if score_gap is not None else snap.get("score_gap"),
+        primary_odds=primary_odds if primary_odds is not None else snap.get("primary_odds"),
+        backup_odds=backup_odds if backup_odds is not None else snap.get("backup_odds"),
+        scheduled_jump=scheduled_jump or str(snap.get("scheduled_jump") or ""),
+        locked=lock,
+        locked_at=(datetime.now().timestamp() if lock else None),
+        db_path=db_path,
+    )
+
+
+def confirm_pick(
+    meeting_date: date | str,
+    meeting_url: str,
+    race_no: int,
+    db_path: Path = _DEFAULT_DB,
+) -> bool:
+    return lock_pick(_as_date(meeting_date), meeting_url, int(race_no), db_path=db_path)
+
+
+def maybe_autolock(
+    pick: dict[str, Any],
+    *,
+    now: datetime,
+    jump_at: Optional[datetime],
+    db_path: Path = _DEFAULT_DB,
+) -> dict[str, Any]:
+    """Lock a stored pick when the race is within the pre-jump window or has jumped."""
+    if pick.get("locked"):
+        return pick
+    if jump_at is None:
+        return pick
+    if now + LOCK_BEFORE_JUMP < jump_at:
+        return pick
+    d = _as_date(pick.get("meeting_date") or pick.get("date"))
+    meeting_url = str(pick.get("meeting_url") or "")
+    race_no = int(pick.get("race_no") or 0)
+    if not meeting_url or not race_no:
+        return pick
+    lock_pick(d, meeting_url, race_no, db_path=db_path)
+    updated = get_pick(d, meeting_url, race_no, db_path=db_path)
+    return updated or {**pick, "locked": True}
+
+
+def record_primary_scratching(
+    meeting_date: date | str,
+    meeting_url: str,
+    race_no: int,
+    db_path: Path = _DEFAULT_DB,
+) -> dict[str, Any] | None:
+    d = _as_date(meeting_date)
+    mark_primary_scratched(d, meeting_url, int(race_no), db_path=db_path)
+    return get_pick(d, meeting_url, int(race_no), db_path=db_path)
+
+
+def snapshot_field(runners: list, ranked_by_name: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in runners or []:
+        name = str(getattr(r, "name", "") or "")
+        ranked = (ranked_by_name or {}).get(name)
+        out.append(
+            {
+                "name": name,
+                "draw": getattr(r, "draw", None),
+                "scratched": bool(getattr(r, "scratched", False)),
+                "jockey": getattr(r, "jockey_or_driver", None),
+                "trainer": getattr(r, "trainer", None),
+                "weight_kg": getattr(r, "weight_kg", None),
+                "last10": getattr(r, "last10", None),
+                "score": float(getattr(ranked, "score", 0.0) or 0.0) if ranked is not None else None,
+                "rank": getattr(ranked, "rank", None) if ranked is not None else None,
+            }
+        )
+    return out

@@ -1,0 +1,9 @@
+target-version = "py310"
+src = ["."]
+
+[lint]
+select = ["E9", "F"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"tests/*" = ["F401"]
