@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
@@ -36,8 +37,23 @@ def official_program_number(headers: list, cells: list) -> Optional[int]:
     return program_number_from_raw(headers, cells)
 
 
+log = logging.getLogger("race_day_rater.calendar")
+
 BASE = "https://www.racingaustralia.horse"
 CAL_URL = "https://www.racingaustralia.horse/FreeFields/Calendar.aspx?State={state}"
+CALENDAR_STATES = ("NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT")
+
+
+class MeetingList(list):
+    """list[Meeting] plus calendar diagnostics. Streamlit can iterate it as a list."""
+
+    failed_states: list[str]
+    failed_details: list[str]
+
+    def __init__(self, meetings=(), *, failed_states=None, failed_details=None):
+        super().__init__(meetings)
+        self.failed_states = list(failed_states or [])
+        self.failed_details = list(failed_details or [])
 
 # Key shape: 2025Dec06,WA,Ascot
 _KEY_RE = re.compile(r"^\s*(\d{4})([A-Za-z]{3})(\d{2})\s*$")
@@ -406,19 +422,7 @@ def enrich_runners_with_silks(
     return _apply_form_extras_to_runners(runners_by_race, extras)
 
 
-def fetch_meetings_for_date(meeting_date: date, *, ttl_seconds: int = 300) -> list[Meeting]:
-    """
-    Fetch *all Australian* thoroughbred meetings for a given date using Racing Australia FreeFields.
-    We scrape state calendar pages and collect Acceptances links (Key=YYYYMonDD,STATE,VENUE).
-    """
-    states = ["NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"]
-    now_local = datetime.now().astimezone()
-
-    # We prefer Acceptances when present (best runner detail), but some calendar rows
-    # may not include acceptances links even when a meeting exists (e.g. only Weights is linked).
-    # So we accept multiple page types and dedupe by meeting Key.
-    best_by_key: dict[str, tuple[int, str, str, str]] = {}  # key -> (priority, url, venue, state)
-    # priority: higher wins
+def _calendar_priority(href: str) -> Optional[int]:
     priorities = {
         "Acceptances.aspx?Key=": 4,
         "Form.aspx?Key=": 3,
@@ -427,35 +431,65 @@ def fetch_meetings_for_date(meeting_date: date, *, ttl_seconds: int = 300) -> li
         "RaceProgram.aspx?Key=": 1,
         "Nominations.aspx?Key=": 0,
     }
+    for frag, p in priorities.items():
+        if frag in (href or ""):
+            return p
+    return None
 
-    for st in states:
+
+def _collect_calendar_links(html_text: str, meeting_date: date, best_by_key: dict[str, tuple[int, str, str, str]]) -> None:
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        pr = _calendar_priority(href)
+        if pr is None:
+            continue
+        full = urljoin(BASE, href)
+        key = _key_from_url(full)
+        if not key:
+            continue
+        parts = [p.strip() for p in key.split(",") if p.strip()]
+        if len(parts) < 3:
+            continue
+        d = _parse_key_date(parts[0])
+        if d != meeting_date:
+            continue
+        venue = parts[2].strip()
+        state = parts[1].strip()
+        cur = best_by_key.get(key)
+        if cur is None or pr > cur[0]:
+            best_by_key[key] = (pr, full, venue, state)
+
+
+def fetch_meetings_for_date(meeting_date: date, *, ttl_seconds: int = 300) -> list[Meeting]:
+    """
+    Fetch *all Australian* thoroughbred meetings for a given date using Racing Australia FreeFields.
+    We scrape state calendar pages and collect Acceptances links (Key=YYYYMonDD,STATE,VENUE).
+
+    Each state calendar is isolated: a timeout or parse failure for one state does not
+    discard meetings already collected from the others. The returned object is a list
+    (compatible with existing Streamlit callers) with `.failed_states` / `.failed_details`.
+    """
+    now_local = datetime.now().astimezone()
+    best_by_key: dict[str, tuple[int, str, str, str]] = {}
+    failed_states: list[str] = []
+    failed_details: list[str] = []
+
+    for st in CALENDAR_STATES:
         url = CAL_URL.format(state=st)
-        resp = get(url, ttl_seconds=ttl_seconds)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.find_all("a"):
-            href = a.get("href") or ""
-            pr = None
-            for frag, p in priorities.items():
-                if frag in href:
-                    pr = p
-                    break
-            if pr is None:
-                continue
-            full = urljoin(BASE, href)
-            key = _key_from_url(full)
-            if not key:
-                continue
-            parts = [p.strip() for p in key.split(",") if p.strip()]
-            if len(parts) < 3:
-                continue
-            d = _parse_key_date(parts[0])
-            if d != meeting_date:
-                continue
-            venue = parts[2].strip()
-            state = parts[1].strip()
-            cur = best_by_key.get(key)
-            if cur is None or pr > cur[0]:
-                best_by_key[key] = (pr, full, venue, state)
+        try:
+            resp = get(url, ttl_seconds=ttl_seconds)
+            _collect_calendar_links(resp.text, meeting_date, best_by_key)
+        except (FetchError, ParseError, OSError, TimeoutError) as exc:
+            log.warning("Racing Australia calendar unavailable for %s: %s", st, exc)
+            failed_states.append(st)
+            failed_details.append(f"{st}: {exc}")
+            continue
+        except Exception as exc:
+            log.exception("Racing Australia calendar failed for %s", st)
+            failed_states.append(st)
+            failed_details.append(f"{st}: {exc}")
+            continue
 
     meetings: list[Meeting] = []
     for key, (_pr, full, venue, state) in best_by_key.items():
@@ -472,7 +506,14 @@ def fetch_meetings_for_date(meeting_date: date, *, ttl_seconds: int = 300) -> li
                 extra={"state": state, "key": key},
             )
         )
-    return sorted(meetings, key=lambda m: (m.extra.get("state") or "", m.venue))
+    ordered = sorted(meetings, key=lambda m: (m.extra.get("state") or "", m.venue))
+    if failed_states:
+        log.warning(
+            "Calendar partial: %s meetings from successful states; failed=%s",
+            len(ordered),
+            ",".join(failed_states),
+        )
+    return MeetingList(ordered, failed_states=failed_states, failed_details=failed_details)
 
 
 def fetch_races_and_runners_for_meeting(meeting_url: str, *, ttl_seconds: int = 300) -> tuple[list[Race], dict[int, list[Runner]], dict]:

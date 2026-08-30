@@ -19,7 +19,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
-from db_cache import _DEFAULT_DB
+from db_cache import _DEFAULT_DB, default_db_path
 
 
 def _conn(db_path: Path = _DEFAULT_DB) -> sqlite3.Connection:
@@ -108,6 +108,12 @@ def _migrate_picks_columns(conn: sqlite3.Connection) -> None:
             ("scheduled_jump", "TEXT"),
             ("primary_number", "INTEGER"),
             ("backup_number", "INTEGER"),
+            ("original_backup", "TEXT"),
+            ("backup_scratched", "INTEGER"),
+            ("scratching_source", "TEXT"),
+            ("scratching_detected_at", "TEXT"),
+            ("active_primary", "TEXT"),
+            ("active_backup", "TEXT"),
         ),
     )
 
@@ -173,7 +179,7 @@ def display_jockey_name(name: str) -> str:
 def db_status(db_path: Path = _DEFAULT_DB) -> dict[str, Any]:
     """Counts and path for UI / tracking health."""
     out: dict[str, Any] = {
-        "path": str(db_path.resolve()),
+        "path": str((db_path if db_path is not None else default_db_path()).resolve()),
         "exists": db_path.exists(),
         "picks": 0,
         "results": 0,
@@ -349,7 +355,9 @@ _PICK_SELECT = """
     field_size, status, just_place, just_place_score,
     locked, locked_at, confidence_label, score_gap, primary_odds, backup_odds,
     original_primary, primary_scratched, backup_promoted, scheduled_jump,
-    primary_number, backup_number
+    primary_number, backup_number,
+    original_backup, backup_scratched, scratching_source, scratching_detected_at,
+    active_primary, active_backup
 """
 
 
@@ -385,6 +393,12 @@ def _row_to_pick(r: tuple) -> dict:
         scheduled_jump,
         primary_number,
         backup_number,
+        original_backup,
+        backup_scratched,
+        scratching_source,
+        scratching_detected_at,
+        active_primary,
+        active_backup,
     ) = r
     extra = {
         "locked": bool(locked),
@@ -399,6 +413,12 @@ def _row_to_pick(r: tuple) -> dict:
         "scheduled_jump": scheduled_jump or "",
         "primary_number": primary_number,
         "backup_number": backup_number,
+        "original_backup": original_backup or "",
+        "backup_scratched": bool(backup_scratched),
+        "scratching_source": scratching_source or "",
+        "scratching_detected_at": scratching_detected_at or "",
+        "active_primary": active_primary or "",
+        "active_backup": active_backup or "",
         "saved_at": saved_at,
         "roughie": roughie or "",
         "just_place": just_place or "",
@@ -524,6 +544,12 @@ def save_pick(
     scheduled_jump: str = "",
     primary_number: Optional[int] = None,
     backup_number: Optional[int] = None,
+    original_backup: str = "",
+    backup_scratched: Optional[bool] = None,
+    scratching_source: str = "",
+    scratching_detected_at: str = "",
+    active_primary: str = "",
+    active_backup: str = "",
     force: bool = False,
     db_path: Path = _DEFAULT_DB,
 ) -> bool:
@@ -618,7 +644,7 @@ def save_pick(
             if locked_at is None:
                 locked_at = existing_pick.get("locked_at")
             if not original_primary:
-                original_primary = existing_pick.get("original_primary") or ""
+                original_primary = existing_pick.get("original_primary") or existing_pick.get("pick_name") or ""
             if primary_scratched is None:
                 primary_scratched = bool(existing_pick.get("primary_scratched"))
             if backup_promoted is None:
@@ -627,6 +653,18 @@ def save_pick(
                 primary_number = existing_pick.get("primary_number")
             if backup_number is None:
                 backup_number = existing_pick.get("backup_number")
+            if not original_backup:
+                original_backup = existing_pick.get("original_backup") or existing_pick.get("backup") or ""
+            if backup_scratched is None:
+                backup_scratched = bool(existing_pick.get("backup_scratched"))
+            if not scratching_source:
+                scratching_source = existing_pick.get("scratching_source") or ""
+            if not scratching_detected_at:
+                scratching_detected_at = existing_pick.get("scratching_detected_at") or ""
+            if not active_primary:
+                active_primary = existing_pick.get("active_primary") or ""
+            if not active_backup:
+                active_backup = existing_pick.get("active_backup") or ""
             if not blob and existing[8]:
                 blob = existing[8]
             if primary_odds is None:
@@ -640,6 +678,11 @@ def save_pick(
             if not scheduled_jump:
                 scheduled_jump = existing_pick.get("scheduled_jump") or ""
 
+        if not original_primary:
+            original_primary = best_pick or ""
+        if not original_backup:
+            original_backup = backup or ""
+
         conn.execute(
             """INSERT OR REPLACE INTO picks
                (date, meeting_url, code, race_no, venue, race_label, best_pick, backup,
@@ -647,8 +690,10 @@ def save_pick(
                 field_size, status, just_place, just_place_score,
                 locked, locked_at, confidence_label, score_gap, primary_odds, backup_odds,
                 original_primary, primary_scratched, backup_promoted, scheduled_jump,
-                primary_number, backup_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                primary_number, backup_number,
+                original_backup, backup_scratched, scratching_source, scratching_detected_at,
+                active_primary, active_backup)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 d.isoformat(),
                 meeting_url,
@@ -680,6 +725,12 @@ def save_pick(
                 scheduled_jump or "",
                 primary_number,
                 backup_number,
+                original_backup or "",
+                1 if backup_scratched else 0,
+                scratching_source or "",
+                scratching_detected_at or "",
+                active_primary or "",
+                active_backup or "",
             ),
         )
         conn.commit()
@@ -715,26 +766,91 @@ def mark_primary_scratched(
     meeting_url: str,
     race_no: int,
     db_path: Path = _DEFAULT_DB,
+    *,
+    source: str = "",
+    detected_at: str = "",
+    active_primary: str = "",
+    active_backup: str = "",
+    backup_scratched: Optional[bool] = None,
+    backup_promoted: Optional[bool] = None,
+    original_backup: str = "",
 ) -> bool:
-    """Preserve original primary and record that the backup was promoted."""
+    """Preserve original primary and record late-scratching / promotion flags. Idempotent."""
     try:
         conn = _conn(db_path)
         row = conn.execute(
-            "SELECT best_pick, original_primary, backup FROM picks WHERE date = ? AND meeting_url = ? AND race_no = ?",
+            """SELECT best_pick, original_primary, backup, original_backup, primary_scratched,
+                      backup_promoted, backup_scratched, scratching_source, scratching_detected_at,
+                      active_primary, active_backup
+               FROM picks WHERE date = ? AND meeting_url = ? AND race_no = ?""",
             (d.isoformat(), meeting_url, int(race_no)),
         ).fetchone()
         if row is None:
             conn.close()
             return False
-        best_pick, original_primary, backup = row
+        (
+            best_pick,
+            original_primary,
+            backup,
+            orig_backup,
+            already_primary,
+            already_promoted,
+            already_backup,
+            existing_source,
+            existing_at,
+            existing_active_p,
+            existing_active_b,
+        ) = row
         preserved = (original_primary or "").strip() or (best_pick or "")
+        preserved_backup = (orig_backup or "").strip() or (original_backup or backup or "")
+        sources = [s for s in str(existing_source or "").split(",") if s]
+        if source and source not in sources:
+            sources.append(source)
+        new_active_p = active_primary or existing_active_p or ""
+        new_active_b = active_backup if active_backup else (existing_active_b or "")
+        detected = detected_at or existing_at or ""
+        bscratch = already_backup if backup_scratched is None else (1 if backup_scratched else 0)
+        if backup_promoted is None:
+            promote = bool(active_primary or backup) and not bool(bscratch)
+            promoted = 1 if (already_promoted or promote) else 0
+        else:
+            promoted = 1 if backup_promoted else 0
+        # No-op if flags and actives already match.
+        if (
+            already_primary
+            and bool(already_promoted) == bool(promoted)
+            and (existing_source or "") == ",".join(sources)
+            and (existing_active_p or "") == (new_active_p or "")
+            and (existing_active_b or "") == (new_active_b or "")
+            and bool(already_backup) == bool(bscratch)
+        ):
+            conn.close()
+            return True
         conn.execute(
             """UPDATE picks
                SET primary_scratched = 1,
-                   backup_promoted = CASE WHEN ? != '' THEN 1 ELSE backup_promoted END,
-                   original_primary = ?
+                   backup_promoted = ?,
+                   original_primary = ?,
+                   original_backup = COALESCE(NULLIF(original_backup, ''), ?),
+                   backup_scratched = ?,
+                   scratching_source = ?,
+                   scratching_detected_at = COALESCE(NULLIF(scratching_detected_at, ''), ?),
+                   active_primary = ?,
+                   active_backup = ?
                WHERE date = ? AND meeting_url = ? AND race_no = ?""",
-            (backup or "", preserved, d.isoformat(), meeting_url, int(race_no)),
+            (
+                promoted,
+                preserved,
+                preserved_backup,
+                1 if bscratch else 0,
+                ",".join(sources),
+                detected,
+                new_active_p or "",
+                new_active_b or "",
+                d.isoformat(),
+                meeting_url,
+                int(race_no),
+            ),
         )
         conn.commit()
         conn.close()

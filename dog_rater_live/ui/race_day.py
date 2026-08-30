@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from race_db import load_picks as db_load_picks
-from services.pick_service import maybe_autolock, record_primary_scratching, save_selection_snapshot, snapshot_field
+from services.pick_service import apply_view_scratching, maybe_autolock, save_selection_snapshot, snapshot_field
 from services.race_day_service import (
     AU_STATES,
     RaceView,
@@ -169,7 +169,7 @@ def render_race_day(
     )
 
     for v in views:
-        if not v.primary:
+        if not v.primary or getattr(v, "no_active_selection", False):
             continue
         if v.from_snapshot and v.locked:
             continue
@@ -197,8 +197,8 @@ def render_race_day(
                 continue
             updated = maybe_autolock(saved, now=now, jump_at=v.jump_at)
             picks_index[v.race_key] = updated
-            if v.scratching_warning and not updated.get("primary_scratched"):
-                scratched = record_primary_scratching(chosen_date, v.meeting_url, v.race_no)
+            if v.primary_scratched or v.backup_scratched or v.no_active_selection:
+                scratched = apply_view_scratching(v, chosen_date=chosen_date, now=now)
                 if scratched:
                     picks_index[v.race_key] = scratched
 
@@ -253,18 +253,29 @@ def _render_hero(hero: RaceView, now: datetime, chosen_date: date) -> None:
     )
     c1, c2, c3 = st.columns(3)
     with c1:
-        pick_metric("Primary", pick_cell(hero.primary_no, hero.primary, hero.odds))
+        if hero.no_active_selection:
+            pick_metric("Primary", "NO ACTIVE SELECTION")
+        elif hero.locked and hero.primary_scratched:
+            orig = pick_cell(hero.original_primary_no, hero.original_primary)
+            pick_metric("Original primary", f"{orig} — SCRATCHED")
+        else:
+            pick_metric("Primary", pick_cell(hero.primary_no, hero.primary, hero.odds))
     with c2:
-        pick_metric("Backup", pick_cell(hero.backup_no, hero.backup, hero.backup_odds))
+        if hero.locked and hero.primary_scratched:
+            pick_metric("Promoted primary", pick_cell(hero.primary_no, hero.primary, hero.odds) if hero.primary else "NO ACTIVE SELECTION")
+        else:
+            pick_metric("Backup", pick_cell(hero.backup_no, hero.backup, hero.backup_odds))
     with c3:
         st.metric("Confidence", hero.confidence_label or "—")
         st.caption("Label from score gap, not a probability.")
+        if hero.selection_warning:
+            st.caption(hero.selection_warning)
     b1, b2, b3 = st.columns([1, 1, 2])
     with b1:
         if st.button("Open race", key="hero_open"):
             _open_race(hero)
     with b2:
-        if st.button("Confirm / save pick", key="hero_lock", disabled=not hero.primary):
+        if st.button("Confirm / save pick", key="hero_lock", disabled=not hero.primary or hero.no_active_selection):
             _save_and_lock(hero, chosen_date)
             st.success("Pick locked as a snapshot.")
             st.rerun()

@@ -81,32 +81,62 @@ class NextRaceCard(QFrame):
             self.confidence.setText("—")
             self.lock_state.setText("")
             self.warn.setText("")
+            self.warn.setVisible(False)
+            self.kicker.setText("NEXT TO JUMP")
             self.open_btn.setEnabled(False)
             self.lock_btn.setEnabled(False)
             return
+        jumping = view.status == "in_progress" or (view.jump_at is not None and view.jump_at <= now)
+        self.kicker.setText("NOW JUMPING" if jumping else "NEXT TO JUMP")
         dist = f"{view.distance_m}m" if view.distance_m else "—"
         self.title.setText(f"{view.venue}  R{view.race_no}")
         self.meta.setText(
             f"{view.clock()}  ·  {view.countdown(now)}  ·  {dist}  ·  {view.race_class or '—'}  ·  {view.track_condition or '—'}"
         )
-        self.primary.setText(format_runner_pick(view.primary_no, view.primary, view.odds))
-        self.backup.setText(format_runner_pick(view.backup_no, view.backup, view.backup_odds))
-        self.confidence.setText(view.confidence_label or "—")
+        if view.no_active_selection:
+            self.primary.setText("NO ACTIVE SELECTION")
+            self.backup.setText("—")
+        elif view.locked and view.primary_scratched:
+            orig = format_runner_pick(view.original_primary_no, view.original_primary)
+            self.primary.setText(f"{orig} — SCRATCHED")
+            self.backup.setText(
+                f"→ {format_runner_pick(view.primary_no, view.primary, view.odds)}"
+                if view.primary
+                else "NO ACTIVE SELECTION"
+            )
+        else:
+            self.primary.setText(format_runner_pick(view.primary_no, view.primary, view.odds))
+            self.backup.setText(format_runner_pick(view.backup_no, view.backup, view.backup_odds))
+        if view.locked and view.primary_scratched and view.backup:
+            self.confidence.setText(
+                (view.confidence_label or "—") + f"  ·  new backup {format_runner_pick(view.backup_no, view.backup, view.backup_odds)}"
+            )
+        else:
+            self.confidence.setText(view.confidence_label or "—")
         lock = "Saved snapshot" if view.from_snapshot else "Live model pick"
         if view.locked:
             lock += " · locked"
+        if view.backup_promoted:
+            lock += " · backup promoted"
         self.lock_state.setText(lock)
-        self.warn.setText("Scratching warning" if view.scratching_warning else "")
+        warn = view.selection_warning or ("Scratching warning" if view.scratching_warning else "")
+        self.warn.setText(warn)
+        self.warn.setVisible(bool(warn))
         self.open_btn.setEnabled(True)
-        self.lock_btn.setEnabled(bool(view.primary) and not view.locked)
+        self.lock_btn.setEnabled(bool(view.primary) and not view.locked and not view.no_active_selection)
 
     def tick(self, now: datetime) -> None:
-        if self._view is not None:
-            dist = f"{self._view.distance_m}m" if self._view.distance_m else "—"
-            self.meta.setText(
-                f"{self._view.clock()}  ·  {self._view.countdown(now)}  ·  {dist}  ·  "
-                f"{self._view.race_class or '—'}  ·  {self._view.track_condition or '—'}"
-            )
+        if self._view is None:
+            return
+        jumping = self._view.status == "in_progress" or (
+            self._view.jump_at is not None and self._view.jump_at <= now
+        )
+        self.kicker.setText("NOW JUMPING" if jumping else "NEXT TO JUMP")
+        dist = f"{self._view.distance_m}m" if self._view.distance_m else "—"
+        self.meta.setText(
+            f"{self._view.clock()}  ·  {self._view.countdown(now)}  ·  {dist}  ·  "
+            f"{self._view.race_class or '—'}  ·  {self._view.track_condition or '—'}"
+        )
 
     @property
     def view(self) -> RaceView | None:

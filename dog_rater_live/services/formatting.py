@@ -30,13 +30,14 @@ def format_countdown(jump_at: Optional[datetime], now: Optional[datetime]) -> st
         return "Jumped"
     if secs <= 0:
         return "Jumping"
-    mins, rem = divmod(secs, 60)
-    hours, mins = divmod(mins, 60)
+    if secs < 60:
+        return f"{secs}s"
+    # Round remaining minutes up so 13:26 at 13:22:19 shows 4m, not 3m.
+    mins_ceil = (secs + 59) // 60
+    hours, mins = divmod(mins_ceil, 60)
     if hours > 0:
         return f"{hours}h {mins}m"
-    if mins > 0:
-        return f"{mins}m"
-    return f"{rem}s"
+    return f"{mins}m"
 
 
 def format_clock(dt: Optional[datetime]) -> str:
@@ -53,6 +54,16 @@ def minutes_until(jump_at: Optional[datetime], now: Optional[datetime]) -> Optio
 
 def tb_race_duration() -> timedelta:
     return timedelta(minutes=35)
+
+
+def hero_running_hold() -> timedelta:
+    """Keep the hero on a race after jump while it is still running."""
+    return timedelta(minutes=4)
+
+
+def hero_yield_before_next() -> timedelta:
+    """Leave a running hero this far before the next race jumps."""
+    return timedelta(seconds=90)
 
 
 def format_runner_pick(number=None, name: str = "", odds=None) -> str:
@@ -93,9 +104,14 @@ def format_saved_selection(pick: dict | None, which: str = "primary") -> str:
 
     pick = pick or {}
     if which == "backup":
-        name = str(pick.get("backup") or "")
+        name = str(pick.get("original_backup") or pick.get("backup") or "")
         odds = pick.get("backup_odds")
     else:
         name = str(pick.get("original_primary") or pick.get("pick_name") or "")
         odds = pick.get("primary_odds")
-    return format_runner_pick(number=saved_pick_number(pick, which), name=name, odds=odds)
+    text = format_runner_pick(number=saved_pick_number(pick, which), name=name, odds=odds)
+    if which == "backup" and pick.get("backup_scratched"):
+        return f"{text} — SCRATCHED" if name else text
+    if which != "backup" and pick.get("primary_scratched"):
+        return f"{text} — SCRATCHED" if name else text
+    return text

@@ -13,8 +13,13 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-# Default DB next to ./cache/ (same parent as fetch disk cache)
+# Default DB next to this package's cache/ directory (absolute; not CWD-relative).
 _DEFAULT_DB = Path(__file__).resolve().parent / "cache" / "roster.db"
+
+
+def default_db_path() -> Path:
+    """Absolute SQLite path shared by Streamlit and the desktop app."""
+    return _DEFAULT_DB.expanduser().resolve()
 
 # TTL in seconds per cache kind (meetings vs fields)
 TTL_MEETINGS = 30 * 60   # 30 min

@@ -22,6 +22,9 @@ def test_refresh_coalesce():
     follow = g.finish()
     assert follow == "card"
     assert g.request("odds") is True
+    follow2 = g.finish()
+    assert follow2 == "results"
+    g.request("odds")
     g.finish()
 
 

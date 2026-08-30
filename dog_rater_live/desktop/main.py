@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import logging
 import sys
-from pathlib import Path
 
 from desktop import APP_NAME, ORG_NAME
+from desktop.paths import desktop_log_path, shared_default_db_path
+from desktop.themes.theme_manager import apply_to_application
 
 log = logging.getLogger("race_day_rater")
 
 
-def _load_qss(app) -> None:
-    qss = Path(__file__).resolve().parent / "resources" / "styles.qss"
+def _load_qss(app, theme_id: str | None = None) -> None:
     try:
-        app.setStyleSheet(qss.read_text(encoding="utf-8"))
+        apply_to_application(app, theme_id)
     except Exception:
-        log.exception("Could not load stylesheet")
+        log.exception("Could not apply theme stylesheet")
 
 
 def _configure_logging() -> None:
@@ -27,7 +27,7 @@ def _configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        log_path = Path(__file__).resolve().parent.parent / "cache" / "desktop.log"
+        log_path = desktop_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
@@ -50,22 +50,35 @@ def create_app(argv=None):
         app = QApplication(list(argv) if argv is not None else sys.argv)
         created = True
         app.setApplicationDisplayName(APP_NAME)
-        _load_qss(app)
     from desktop.application_controller import ApplicationController
     from desktop.main_window import MainWindow
     from desktop.settings import DesktopSettings
 
-    controller = ApplicationController(DesktopSettings())
+    settings = DesktopSettings()
+    _load_qss(app, settings.theme)
+    controller = ApplicationController(settings)
     window = MainWindow(controller)
+    log.info("Database: %s", shared_default_db_path())
+    log.info("Resolved database: %s exists=%s", controller.settings.db_path, controller.settings.db_path.exists())
+    if controller.settings.db_path_warning:
+        log.warning("%s", controller.settings.db_path_warning)
     if created:
         app.aboutToQuit.connect(controller.shutdown)
     return app, window
 
 
 def main(argv=None) -> int:
+    argv = list(argv) if argv is not None else sys.argv
+    demo = "--demo-grids" in argv
+    argv = [a for a in argv if a != "--demo-grids"]
     app, window = create_app(argv)
+    if demo:
+        from desktop.demo_fixture import load_demo_grids
+
+        load_demo_grids(window)
     window.show()
-    window.controller.start()
+    if not demo:
+        window.controller.start()
     return app.exec()
 
 

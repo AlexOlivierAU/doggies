@@ -5,19 +5,27 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtGui import QColor
 
-from services.formatting import format_saved_selection
-from services.result_service import (
-    BACKUP_WON,
-    LOST,
-    PRIMARY_SCRATCHED,
-    RESULT_UNAVAILABLE,
-    VOID,
-    WIN,
-    daily_summary,
-    resolve_pick_result,
+from desktop.roles import (
+    BARRIER_ROLE,
+    CONFIDENCE_ROLE,
+    DETAIL_ROLE,
+    HORSE_NAME_ROLE,
+    ODDS_ROLE,
+    PICK_ROLE,
+    PROGRAM_NUMBER_ROLE,
+    RACE_KEY_ROLE,
+    RESULT_STATUS_ROLE,
+    ROW_TONE_ROLE,
+    SCRATCHED_ROLE,
+    SILK_URL_ROLE,
+    SORT_ROLE,
+    SOURCE_ROLE,
 )
+from desktop.table_theme import result_tone
+from services.formatting import format_saved_selection
+from services.result_service import daily_summary, resolve_pick_result
+from services.runner_numbers import saved_pick_number
 
 HEADERS = [
     "Result",
@@ -33,14 +41,14 @@ HEADERS = [
     "Source",
 ]
 
-STATUS_COLOURS = {
-    WIN: QColor("#2e7d32"),
-    BACKUP_WON: QColor("#6a1b9a"),
-    LOST: QColor("#c62828"),
-    PRIMARY_SCRATCHED: QColor("#9e9e9e"),
-    VOID: QColor("#9e9e9e"),
-    RESULT_UNAVAILABLE: QColor("#546e7a"),
-}
+
+def _field_entry(pick: dict, name: str) -> dict:
+    snap = pick.get("snapshot") if isinstance(pick.get("snapshot"), dict) else {}
+    field = snap.get("field") or pick.get("field") or []
+    for item in field or []:
+        if str(item.get("name") or "") == str(name or ""):
+            return item
+    return {}
 
 
 def pick_rows_from_views(views, picks_index: dict, results_by_key: dict, now) -> tuple[list[dict[str, Any]], Any]:
@@ -55,10 +63,15 @@ def pick_rows_from_views(views, picks_index: dict, results_by_key: dict, now) ->
         jump_at = view.jump_at if view else None
         result = results_by_key.get(key) or results_by_key.get((key[0], int(key[1]))) or {}
         resolved = resolve_pick_result(pick, result, now=now, jump_at=jump_at)
+        primary_name = str(pick.get("original_primary") or pick.get("pick_name") or "")
+        backup_name = str(pick.get("backup") or "")
+        p_field = _field_entry(pick, primary_name)
+        b_field = _field_entry(pick, backup_name)
+        status = resolved.status
         row = {
             **pick,
             **resolved.as_dict(),
-            "result": resolved.status,
+            "result": status,
             "jump": view.clock() if view else (str(pick.get("scheduled_jump") or "")[11:16] or "—"),
             "venue": pick.get("venue") or (view.venue if view else ""),
             "race": f"R{pick.get('race_no')}",
@@ -73,6 +86,20 @@ def pick_rows_from_views(views, picks_index: dict, results_by_key: dict, now) ->
             "source": resolved.result_source or resolved.match_note,
             "race_key": key,
             "jump_at": jump_at,
+            "row_tone": result_tone(status),
+            "primary_name": primary_name,
+            "backup_name": backup_name,
+            "primary_no": saved_pick_number(pick, "primary"),
+            "backup_no": saved_pick_number(pick, "backup"),
+            "primary_silk": p_field.get("silk_url") or "",
+            "backup_silk": b_field.get("silk_url") or "",
+            "primary_barrier": p_field.get("draw"),
+            "backup_barrier": b_field.get("draw"),
+            "primary_scratched": bool(p_field.get("scratched") or pick.get("primary_scratched")),
+            "backup_scratched": bool(b_field.get("scratched") or pick.get("backup_scratched")),
+            "primary_odds": pick.get("primary_odds"),
+            "backup_odds": pick.get("backup_odds"),
+            "from_snapshot": True,
         }
         resolved_rows.append(row)
         table.append(row)
@@ -123,12 +150,36 @@ class PicksTableModel(QAbstractTableModel):
                 row.get("source") or "",
             ]
             return values[col]
-        if role == Qt.ItemDataRole.ForegroundRole:
-            colour = STATUS_COLOURS.get(str(row.get("result") or ""))
-            if colour is not None and col == 0:
-                return colour
-        if role == Qt.ItemDataRole.UserRole:
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if col == 10:
+                return str(row.get("source") or "")
+            if col == 0:
+                return str(row.get("result") or "")
+            return self.data(index, Qt.ItemDataRole.DisplayRole)
+        if role == RACE_KEY_ROLE or role == Qt.ItemDataRole.UserRole:
             return row.get("race_key")
+        if role == ROW_TONE_ROLE:
+            return row.get("row_tone")
+        if role == RESULT_STATUS_ROLE and col == 0:
+            return row.get("result")
+        if role == CONFIDENCE_ROLE and col == 9:
+            return row.get("confidence")
+        if role == SOURCE_ROLE:
+            return row.get("source")
+        if col == 4:
+            return _saved_pick_role(row, "primary", role)
+        if col == 7:
+            return _saved_pick_role(row, "backup", role)
+        if col == 6:
+            if role == ODDS_ROLE:
+                return row.get("saved_odds")
+            if role == SORT_ROLE:
+                odds = row.get("saved_odds")
+                return float(odds) if isinstance(odds, (int, float)) else -1.0
+        if role == DETAIL_ROLE:
+            return row
+        if role == SORT_ROLE and col == 0:
+            return str(row.get("result") or "")
         return None
 
     def flags(self, index: QModelIndex):
@@ -141,6 +192,29 @@ class PicksTableModel(QAbstractTableModel):
         self._rows = list(rows)
         self.endResetModel()
 
+    def silk_urls(self) -> list[str]:
+        out = []
+        for row in self._rows:
+            for key in ("primary_silk", "backup_silk"):
+                if row.get(key):
+                    out.append(row[key])
+        return out
+
+    def indexes_for_silk(self, url: str) -> list[QModelIndex]:
+        found = []
+        for i, row in enumerate(self._rows):
+            if row.get("primary_silk") == url:
+                found.append(self.index(i, 4))
+            if row.get("backup_silk") == url:
+                found.append(self.index(i, 7))
+        return found
+
+    def find_row(self, race_key) -> int:
+        for i, row in enumerate(self._rows):
+            if row.get("race_key") == race_key:
+                return i
+        return -1
+
     def row_at(self, row: int) -> Optional[dict[str, Any]]:
         if 0 <= row < len(self._rows):
             return self._rows[row]
@@ -149,3 +223,22 @@ class PicksTableModel(QAbstractTableModel):
     @property
     def rows(self) -> list[dict[str, Any]]:
         return list(self._rows)
+
+
+def _saved_pick_role(row: dict, which: str, role):
+    prefix = "primary" if which == "primary" else "backup"
+    if role == SILK_URL_ROLE:
+        return row.get(f"{prefix}_silk") or ""
+    if role == PROGRAM_NUMBER_ROLE:
+        return row.get(f"{prefix}_no")
+    if role == HORSE_NAME_ROLE:
+        return row.get(f"{prefix}_name")
+    if role == BARRIER_ROLE:
+        return row.get(f"{prefix}_barrier")
+    if role == ODDS_ROLE:
+        return row.get(f"{prefix}_odds") if which == "primary" else row.get("backup_odds")
+    if role == PICK_ROLE:
+        return which
+    if role == SCRATCHED_ROLE:
+        return row.get(f"{prefix}_scratched")
+    return None

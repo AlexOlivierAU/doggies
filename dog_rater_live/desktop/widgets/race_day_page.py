@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (
-    QFrame,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QTableView,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QMenu, QVBoxLayout, QWidget
 
 from desktop.models.picks_table_model import PicksTableModel
-from desktop.models.race_table_model import RACE_KEY_ROLE, RaceTableModel
+from desktop.models.race_table_model import RaceTableModel
 from desktop.widgets.next_race_card import NextRaceCard
+from desktop.widgets.runner_details_dialog import show_runner_details
+from desktop.widgets.styled_table import StyledTableView
 
 
 class _Stat(QFrame):
@@ -38,6 +33,7 @@ class _Stat(QFrame):
 class RaceDayPage(QWidget):
     open_race = Signal(object)
     lock_hero = Signal()
+    lock_race = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -50,32 +46,28 @@ class RaceDayPage(QWidget):
         self.empty.setWordWrap(True)
 
         self.upcoming_model = RaceTableModel(self)
-        self.upcoming = QTableView()
-        self.upcoming.setModel(self.upcoming_model)
-        self.upcoming.setAlternatingRowColors(True)
-        self.upcoming.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.upcoming.setSelectionMode(QTableView.SelectionMode.SingleSelection)
-        self.upcoming.setSortingEnabled(False)
-        self.upcoming.verticalHeader().setVisible(False)
-        self.upcoming.horizontalHeader().setStretchLastSection(True)
-        self.upcoming.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.upcoming = StyledTableView(self, sorting=True, name="upcoming")
+        self.upcoming.set_source_model(self.upcoming_model)
+        self.upcoming.set_pick_columns([4, 6], compact=True)
+        self.upcoming.set_odds_columns([5])
+        self.upcoming.set_badge_columns([7, 8])
         self.upcoming.setMinimumHeight(180)
-        self.upcoming.doubleClicked.connect(self._open_upcoming)
-        self.upcoming.activated.connect(self._open_upcoming)
+        self.upcoming.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.upcoming.row_activated.connect(self._open_row)
+        self.upcoming.context_row.connect(self._upcoming_menu)
 
         self.stats = [_Stat(x) for x in ("Completed", "Primary wins", "Primary places", "Backup wins", "Win SR", "Place SR")]
         self.return_label = QLabel("")
         self.return_label.setObjectName("muted")
 
         self.picks_model = PicksTableModel(self)
-        self.picks = QTableView()
-        self.picks.setModel(self.picks_model)
-        self.picks.setAlternatingRowColors(True)
-        self.picks.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.picks.setSelectionMode(QTableView.SelectionMode.SingleSelection)
-        self.picks.verticalHeader().setVisible(False)
-        self.picks.horizontalHeader().setStretchLastSection(True)
-        self.picks.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.picks = StyledTableView(self, sorting=True, name="picks")
+        self.picks.set_source_model(self.picks_model)
+        self.picks.set_pick_columns([4, 7], compact=True)
+        self.picks.set_odds_columns([6])
+        self.picks.set_badge_columns([0, 9])
+        self.picks.row_activated.connect(self._open_pick_row)
+        self.picks.context_row.connect(self._picks_menu)
 
         root = QVBoxLayout(self)
         root.addWidget(self.hero)
@@ -90,21 +82,19 @@ class RaceDayPage(QWidget):
         root.addWidget(self.return_label)
         root.addWidget(self.picks, 2)
 
-    def _open_upcoming(self, index) -> None:
-        key = self.upcoming_model.data(self.upcoming_model.index(index.row(), 0), RACE_KEY_ROLE)
-        self.open_race.emit(key)
+    def _open_row(self, row) -> None:
+        if row:
+            self.open_race.emit(row.get("race_key"))
+
+    def _open_pick_row(self, row) -> None:
+        if row:
+            self.open_race.emit(row.get("race_key"))
 
     def restore_selection(self, race_key) -> None:
-        row = self.upcoming_model.find_row(race_key)
-        if row >= 0:
-            self.upcoming.selectRow(row)
-            self.upcoming.scrollTo(self.upcoming_model.index(row, 0))
+        self.upcoming.restore_selection(race_key)
 
     def selected_upcoming_key(self):
-        idx = self.upcoming.currentIndex()
-        if not idx.isValid():
-            return None
-        return self.upcoming_model.data(self.upcoming_model.index(idx.row(), 0), RACE_KEY_ROLE)
+        return self.upcoming.selected_key()
 
     def set_summary(self, summary) -> None:
         self.stats[0].set_value(str(summary.completed))
@@ -117,3 +107,44 @@ class RaceDayPage(QWidget):
             self.return_label.setText(f"{summary.estimated_return_label}: {summary.estimated_win_return:+.2f}u")
         else:
             self.return_label.setText("Financial return omitted — saved odds are incomplete.")
+
+    def _upcoming_menu(self, row, pos) -> None:
+        if not row:
+            return
+        menu = QMenu(self)
+        open_act = menu.addAction("Open race")
+        lock_act = menu.addAction("Confirm / lock pick")
+        src_act = menu.addAction("Open source page")
+        menu.addSeparator()
+        copy_horse = menu.addAction("Copy horse name")
+        copy_sum = menu.addAction("Copy race summary")
+        chosen = menu.exec(pos)
+        if chosen is open_act:
+            self.open_race.emit(row.get("race_key"))
+        elif chosen is lock_act:
+            self.lock_race.emit(row.get("race_key"))
+        elif chosen is src_act:
+            url = row.get("race_url") or ""
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
+        elif chosen is copy_horse:
+            QGuiApplication.clipboard().setText(str(row.get("primary_name") or ""))
+        elif chosen is copy_sum:
+            QGuiApplication.clipboard().setText(
+                f"{row.get('venue')} {row.get('race')} {row.get('jump')} {row.get('primary')}"
+            )
+
+    def _picks_menu(self, row, pos) -> None:
+        if not row:
+            return
+        menu = QMenu(self)
+        open_act = menu.addAction("Open race")
+        primary_act = menu.addAction("Primary details")
+        backup_act = menu.addAction("Backup details")
+        chosen = menu.exec(pos)
+        if chosen is open_act:
+            self.open_race.emit(row.get("race_key"))
+        elif chosen is primary_act:
+            show_runner_details({**row, "role": "primary", "name": row.get("primary_name"), "silk": row.get("primary_silk")}, self)
+        elif chosen is backup_act:
+            show_runner_details({**row, "role": "backup", "name": row.get("backup_name"), "silk": row.get("backup_silk")}, self)

@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from models import Meeting, Race, Runner
 from parse_racingaustralia import parse_race_class_label
-from services.formatting import format_clock, format_countdown, minutes_until, tb_race_duration
-from services.ranking import rank_field, selections_from_ranked
-from services.runner_numbers import program_number_for_name, program_number_for_runner, saved_pick_number
+from services.formatting import (
+    format_clock,
+    format_countdown,
+    hero_running_hold,
+    hero_yield_before_next,
+    minutes_until,
+    tb_race_duration,
+)
+from services.runner_numbers import program_number_for_name, program_number_for_runner
+from services.scratching import (
+    effective_scratching_state,
+    odds_rows_from_lookup,
+    persisted_scratch_records,
+    resolve_live_selection,
+)
 
 STATE_TZ = {
     "NSW": "Australia/Sydney",
@@ -25,6 +37,33 @@ STATE_TZ = {
 }
 
 AU_STATES = ("NSW", "VIC", "QLD", "SA", "WA", "TAS")
+
+# Prefer these when several races share a jump minute (picnic/country after metro).
+_METRO_MARKERS = (
+    "rosehill",
+    "randwick",
+    "warwick farm",
+    "canterbury",
+    "flemington",
+    "caulfield",
+    "moonee valley",
+    "sandown",
+    "eagle farm",
+    "doomben",
+    "gold coast",
+    "ascot",
+    "belmont",
+    "morphettville",
+    "murray bridge",
+    "elwick",
+    "hobart",
+    "launceston",
+)
+
+
+def venue_tier(view: object) -> int:
+    raw = f"{getattr(view, 'venue_raw', '')} {getattr(view, 'venue', '')}".lower()
+    return 0 if any(m in raw for m in _METRO_MARKERS) else 1
 
 
 def resolve_tz(name: str) -> ZoneInfo:
@@ -98,6 +137,13 @@ def number_for_name(runners: list[Runner], name: str) -> str:
 
 @dataclass
 class RaceView:
+    """Race-day row.
+
+    ``primary`` / ``backup`` are the *current active* selections (never a scratched
+    runner). ``original_primary`` / ``original_backup`` preserve the first saved
+    names when a late scratching promoted a replacement.
+    """
+
     meeting_url: str
     race_url: str
     code: str
@@ -131,10 +177,37 @@ class RaceView:
     why: list[str] = field(default_factory=list)
     weights: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
+    original_primary: str = ""
+    original_primary_no: str = ""
+    original_backup: str = ""
+    original_backup_no: str = ""
+    primary_scratched: bool = False
+    backup_scratched: bool = False
+    backup_promoted: bool = False
+    scratching_sources: dict[str, list[str]] = field(default_factory=dict)
+    selection_warning: str = ""
+    no_active_selection: bool = False
+    scratch_confirmed_at: str = ""
 
     @property
     def race_key(self) -> tuple[str, int]:
         return (self.meeting_url, int(self.race_no))
+
+    @property
+    def active_primary(self) -> str:
+        return self.primary
+
+    @property
+    def active_backup(self) -> str:
+        return self.backup
+
+    @property
+    def active_primary_no(self) -> str:
+        return self.primary_no
+
+    @property
+    def active_backup_no(self) -> str:
+        return self.backup_no
 
     def countdown(self, now: datetime) -> str:
         return format_countdown(self.jump_at, now)
@@ -162,8 +235,21 @@ def live_status(now: datetime, jump_at: Optional[datetime]) -> str:
 
 def chronological_sort_key(row: RaceView) -> tuple:
     if row.jump_at is None:
-        return (1, 0.0, row.venue, row.race_no)
-    return (0, row.jump_at.timestamp(), row.venue, row.race_no)
+        return (1, 0.0, 1, row.venue, row.race_no)
+    return (0, row.jump_at.timestamp(), venue_tier(row), row.venue, row.race_no)
+
+
+def _attach_active_odds(row: RaceView, odds_lookup: Optional[OddsLookup]) -> None:
+    if not odds_lookup:
+        return
+    if row.primary:
+        o = odds_lookup(row.venue_raw or row.venue, row.race_no, row.primary)
+        if o and not o.get("scratched") and row.odds is None:
+            row.odds = o.get("win")
+    if row.backup:
+        b = odds_lookup(row.venue_raw or row.venue, row.race_no, row.backup)
+        if b and not b.get("scratched") and row.backup_odds is None:
+            row.backup_odds = b.get("win")
 
 
 def build_race_views(
@@ -177,6 +263,7 @@ def build_race_views(
     code: str = "thoroughbred",
     saved_picks: Optional[dict[tuple[str, int], dict]] = None,
     odds_lookup: Optional[OddsLookup] = None,
+    odds_rows_lookup: Optional[Callable[[str, int], list[dict[str, Any]]]] = None,
     rank_upcoming_only: bool = False,
     upcoming_rank_limit: int = 12,
 ) -> list[RaceView]:
@@ -213,7 +300,6 @@ def build_race_views(
                 app_tz=app_tz,
             )
             runners = list(runners_by.get(race_no) or runners_by.get(str(race_no)) or [])
-            field_size = sum(1 for x in runners if not bool(getattr(x, "scratched", False)))
             race_name = str(getattr(r, "name", "") or "")
             class_label = str((getattr(r, "extra", {}) or {}).get("class_label") or "") or parse_race_class_label(
                 race_name
@@ -244,7 +330,7 @@ def build_race_views(
                     confidence_label="",
                     odds=None,
                     backup_odds=None,
-                    field_size=field_size,
+                    field_size=sum(1 for x in runners if not bool(getattr(x, "scratched", False))),
                     scratching_warning=False,
                     locked=False,
                     from_snapshot=False,
@@ -259,87 +345,187 @@ def build_race_views(
     upcoming_ranked = 0
     for row in views:
         saved = saved_picks.get(row.race_key)
-        use_snapshot = bool(saved and (saved.get("locked") or row.status != "upcoming"))
+        locked = bool(saved and saved.get("locked"))
+        odds_rows: list[dict[str, Any]] = []
+        if odds_rows_lookup:
+            try:
+                odds_rows = list(odds_rows_lookup(row.venue_raw or row.venue, row.race_no) or [])
+            except Exception:
+                odds_rows = []
+        if not odds_rows and odds_lookup:
+            odds_rows = odds_rows_from_lookup(odds_lookup, row.venue_raw or row.venue, row.race_no, row.runners)
+        effective = effective_scratching_state(
+            row.runners,
+            odds_rows,
+            persisted_scratch_records(saved),
+            venue=row.venue_raw or row.venue,
+            race_no=row.race_no,
+            now=now,
+        )
+        row.runners = effective.runners
+        row.field_size = effective.field_size
+        row.scratching_sources = {name: list(rec.sources) for name, rec in effective.records.items() if rec.scratched}
+
         should_rank = True
         if rank_upcoming_only:
             should_rank = row.status == "upcoming" and upcoming_ranked < upcoming_rank_limit
-        if use_snapshot and saved:
-            row.from_snapshot = True
-            row.locked = bool(saved.get("locked"))
-            row.primary = str(saved.get("original_primary") or saved.get("pick_name") or "")
-            row.backup = str(saved.get("backup") or "")
-            row.primary_score = saved.get("pick_score")
-            cond = saved.get("conditions") or {}
-            row.backup_score = cond.get("backup_score") if isinstance(cond, dict) else saved.get("backup_score")
-            row.score_gap = float(saved.get("score_gap") or 0.0)
-            row.confidence_label = str(saved.get("confidence_label") or "")
-            row.odds = saved.get("primary_odds")
-            row.backup_odds = saved.get("backup_odds")
-            row.primary_no = str(n) if (n := saved_pick_number(saved, "primary")) is not None else ""
-            row.backup_no = str(n) if (n := saved_pick_number(saved, "backup")) is not None else ""
-            row.why = list(saved.get("why_bullets") or [])
-            row.weights = dict(saved.get("weights") or {})
-            if saved.get("primary_scratched"):
-                row.scratching_warning = True
-        elif should_rank and row.runners:
-            ranked, weights, _rationale = rank_field(
-                row.runners, track_condition=row.meta.get("track_condition")
+        phase = row.status
+        use_snapshot_only = bool(saved) and (locked or phase != "upcoming")
+        if should_rank or use_snapshot_only:
+            resolved = resolve_live_selection(
+                effective=effective,
+                saved=saved,
+                phase=phase,
+                locked=locked,
+                track_condition=row.meta.get("track_condition"),
             )
-            sel = selections_from_ranked(ranked)
-            row.ranked = ranked
-            row.primary = sel["primary"]
-            row.backup = sel["backup"]
-            row.primary_score = sel["primary_score"]
-            row.backup_score = sel["backup_score"]
-            row.score_gap = sel["score_gap"]
-            row.confidence_label = sel["confidence_label"]
-            row.primary_no = number_for_name(row.runners, row.primary)
-            row.backup_no = number_for_name(row.runners, row.backup)
-            row.why = sel["primary_why"]
-            row.weights = {"draw": weights[0], "form": weights[1], "proxy": weights[2], "auto": True}
-            if row.status == "upcoming":
+            row.ranked = resolved.ranked
+            # Active names — never a scratched runner.
+            row.primary = resolved.active_primary
+            row.backup = resolved.active_backup
+            row.primary_no = resolved.active_primary_no
+            row.backup_no = resolved.active_backup_no
+            row.original_primary = resolved.original_primary
+            row.original_primary_no = resolved.original_primary_no
+            row.original_backup = resolved.original_backup
+            row.original_backup_no = resolved.original_backup_no
+            row.primary_scratched = resolved.primary_scratched
+            row.backup_scratched = resolved.backup_scratched
+            row.backup_promoted = resolved.backup_promoted
+            row.no_active_selection = resolved.no_active_selection
+            row.selection_warning = resolved.selection_warning
+            row.primary_score = resolved.primary_score
+            row.backup_score = resolved.backup_score
+            row.score_gap = resolved.score_gap
+            row.confidence_label = resolved.confidence_label
+            row.why = resolved.why
+            row.weights = {"draw": resolved.weights[0], "form": resolved.weights[1], "proxy": resolved.weights[2], "auto": True}
+            row.from_snapshot = resolved.from_snapshot
+            row.locked = locked
+            if resolved.from_snapshot and saved and not resolved.backup_promoted and not resolved.primary_scratched:
+                if row.odds is None:
+                    row.odds = saved.get("primary_odds")
+                if row.backup_odds is None:
+                    row.backup_odds = saved.get("backup_odds")
+            if row.status == "upcoming" and not resolved.from_snapshot:
                 upcoming_ranked += 1
+        elif saved:
+            row.from_snapshot = True
+            row.locked = locked
+            row.original_primary = str(saved.get("original_primary") or saved.get("pick_name") or "")
+            row.original_backup = str(saved.get("original_backup") or saved.get("backup") or "")
+            row.primary = row.original_primary
+            row.backup = row.original_backup
 
-        if odds_lookup and row.primary:
-            o = odds_lookup(row.venue_raw or row.venue, row.race_no, row.primary)
-            if o and not o.get("scratched") and row.odds is None:
-                row.odds = o.get("win")
-            if row.backup:
-                b = odds_lookup(row.venue_raw or row.venue, row.race_no, row.backup)
-                if b and not b.get("scratched") and row.backup_odds is None:
-                    row.backup_odds = b.get("win")
+        if saved and saved.get("scratching_detected_at"):
+            row.scratch_confirmed_at = str(saved.get("scratching_detected_at") or "")
 
-        for runner in row.runners:
-            if not bool(getattr(runner, "scratched", False)):
-                continue
-            n = str(getattr(runner, "name", "") or "")
-            if n and n in {row.primary, row.backup}:
-                row.scratching_warning = True
+        _attach_active_odds(row, odds_lookup)
+
+        if row.primary and effective.is_scratched(row.primary):
+            # Invariant: never leave a scratched horse as the active primary.
+            row.primary = ""
+            row.primary_no = ""
+            row.no_active_selection = True
+            row.selection_warning = row.selection_warning or "NO ACTIVE SELECTION"
+        if row.backup and effective.is_scratched(row.backup):
+            row.backup = ""
+            row.backup_no = ""
+
+        row.scratching_warning = bool(
+            row.primary_scratched or row.backup_scratched or row.selection_warning or row.no_active_selection
+        )
 
     return views
 
 
-def next_to_jump(rows: list[RaceView], now: datetime) -> Optional[RaceView]:
-    upcoming = [r for r in rows if r.jump_at is not None and r.jump_at > now]
-    if not upcoming:
-        live = [
-            r
-            for r in rows
-            if r.jump_at is not None and r.jump_at <= now <= r.jump_at + timedelta(minutes=8)
-        ]
-        if live:
-            return min(live, key=lambda r: r.jump_at or now)
-        return None
-    return min(upcoming, key=lambda r: r.jump_at or now)
+def _on_hero_card(row: RaceView, now: datetime) -> bool:
+    if row.jump_at is None:
+        return False
+    if row.jump_at > now:
+        return True
+    return now <= row.jump_at + hero_running_hold()
 
 
-def upcoming_races(rows: list[RaceView], now: datetime, limit: int = 8) -> list[RaceView]:
-    nxt = next_to_jump(rows, now)
+def _next_is_imminent(upcoming: list[RaceView], now: datetime, current: RaceView) -> bool:
+    cutoff = now + hero_yield_before_next()
+    for row in upcoming:
+        if row.race_key == current.race_key or row.jump_at is None:
+            continue
+        if row.jump_at <= cutoff:
+            return True
+    return False
+
+
+def next_to_jump(rows: list[RaceView], now: datetime, sticky: Optional[RaceView] = None) -> Optional[RaceView]:
+    """Soonest race to track from `rows` at `now`.
+
+    When future races exist, the hero is the chronologically earliest (metro
+    meetings win same-instant ties). A race that has already jumped stays on
+    the card only while it is still in the running window, and only if the
+    next race is not about to jump. Sticky is that live-race rule — it must
+    not pin a later *upcoming* meeting over an earlier one that arrived later.
+    """
     upcoming = [r for r in rows if r.jump_at is not None and r.jump_at > now]
-    upcoming.sort(key=lambda r: r.jump_at or now)
-    # Keep the hero race out of the compact table when possible.
-    rest = [r for r in upcoming if nxt is None or r.race_key != nxt.race_key]
-    return rest[: max(0, int(limit))]
+    upcoming.sort(key=lambda r: (r.jump_at or now, venue_tier(r), r.venue, r.race_no))
+
+    if sticky is not None:
+        live_sticky = next((r for r in rows if r.race_key == sticky.race_key), None)
+        jumped = (
+            live_sticky is not None
+            and live_sticky.jump_at is not None
+            and live_sticky.jump_at <= now
+            and _on_hero_card(live_sticky, now)
+        )
+        if jumped and not _next_is_imminent(upcoming, now, live_sticky):
+            return live_sticky
+
+    running = [
+        r
+        for r in rows
+        if r.jump_at is not None and r.jump_at <= now <= r.jump_at + hero_running_hold()
+    ]
+    if running:
+        running.sort(key=lambda r: (-(r.jump_at or now).timestamp(), venue_tier(r), r.venue))
+        candidate = running[0]
+        if not _next_is_imminent(upcoming, now, candidate):
+            return candidate
+
+    if upcoming:
+        return upcoming[0]
+    return None
+
+
+@dataclass
+class RaceDayState:
+    """Hero + upcoming derived from one `views` list and one `now`."""
+
+    now: datetime
+    hero: Optional[RaceView]
+    upcoming: list[RaceView]
+
+
+def derive_race_day_state(
+    rows: list[RaceView],
+    now: datetime,
+    *,
+    sticky: Optional[RaceView] = None,
+    limit: int = 12,
+) -> RaceDayState:
+    hero = next_to_jump(rows, now, sticky=sticky)
+    upcoming = [r for r in rows if r.jump_at is not None and r.jump_at > now]
+    upcoming.sort(key=lambda r: (r.jump_at or now, venue_tier(r), r.venue, r.race_no))
+    rest = [r for r in upcoming if hero is None or r.race_key != hero.race_key]
+    return RaceDayState(now=now, hero=hero, upcoming=rest[: max(0, int(limit))])
+
+
+def upcoming_races(
+    rows: list[RaceView],
+    now: datetime,
+    limit: int = 8,
+    sticky: Optional[RaceView] = None,
+) -> list[RaceView]:
+    return derive_race_day_state(rows, now, sticky=sticky, limit=limit).upcoming
 
 
 def urgency_color(row: RaceView, now: datetime) -> str:

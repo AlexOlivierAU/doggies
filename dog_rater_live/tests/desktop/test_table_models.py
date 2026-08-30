@@ -138,6 +138,9 @@ def test_chronological_upcoming_order(qapp):
 
 
 def test_result_status_colours(qapp):
+    from desktop.roles import ROW_TONE_ROLE
+    from desktop.themes.theme_manager import current
+
     model = PicksTableModel()
     model.set_rows(
         [
@@ -153,6 +156,7 @@ def test_result_status_colours(qapp):
                 "backup_finish": "—",
                 "confidence": "Strong",
                 "source": "ok",
+                "row_tone": "win",
             },
             {
                 "result": BACKUP_WON,
@@ -166,14 +170,15 @@ def test_result_status_colours(qapp):
                 "backup_finish": "1st",
                 "confidence": "Close race",
                 "source": "ok",
+                "row_tone": "backup_won",
             },
         ]
     )
-    win_colour = model.data(model.index(0, 0), Qt.ItemDataRole.ForegroundRole)
-    backup_colour = model.data(model.index(1, 0), Qt.ItemDataRole.ForegroundRole)
-    assert win_colour is not None
-    assert backup_colour is not None
-    assert win_colour.name() != backup_colour.name()
+    assert model.data(model.index(0, 0), ROW_TONE_ROLE) == "win"
+    assert model.data(model.index(1, 0), ROW_TONE_ROLE) == "backup_won"
+    theme = current()
+    assert theme.semantic.win.name() != theme.semantic.backup_win.name()
+    assert theme.semantic.win.name() != theme.table.selection.name()
 
 
 def test_selection_preserved_across_set_rows(qapp):

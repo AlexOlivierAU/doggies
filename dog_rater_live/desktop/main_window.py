@@ -7,6 +7,7 @@ from datetime import date
 from PySide6.QtCore import QDate, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -25,6 +26,8 @@ from desktop.application_controller import ApplicationController
 from desktop.models.picks_table_model import pick_rows_from_views
 from desktop.models.race_table_model import race_to_row
 from desktop.settings import STATES
+from desktop.status import LOADING_MESSAGE, empty_label
+from desktop.themes.theme_manager import apply_to_application, refresh_styled_widgets
 from desktop.widgets.history_page import HistoryPage
 from desktop.widgets.model_page import ModelPage
 from desktop.widgets.race_day_page import RaceDayPage
@@ -71,6 +74,8 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(idx)
         if idx == 2:
             self.history.set_range(self.controller.chosen_date, self.controller.settings.db_path)
+        self.race_day.empty.setText(LOADING_MESSAGE)
+        self._apply_theme(self.controller.settings.theme)
 
     def _build_toolbar(self) -> None:
         bar = QToolBar("Race Day")
@@ -110,17 +115,29 @@ class MainWindow(QMainWindow):
         self.date_edit.dateChanged.connect(self._date_changed)
         self.state.currentTextChanged.connect(self._state_changed)
         self.auto.toggled.connect(self._auto_toggled)
-        self.refresh_btn.clicked.connect(lambda: c.request_refresh("card", live=True, force=True))
+        self.refresh_btn.clicked.connect(self._manual_refresh)
         c.status_changed.connect(self._status.set_message)
         c.health_changed.connect(self._health)
         c.views_changed.connect(self._apply_views)
         c.clock_ticked.connect(self._tick)
         c.notify.connect(self._toast)
+        c.refresh_busy_changed.connect(self._refresh_busy)
         self.race_day.open_race.connect(self._open_race)
         self.race_day.lock_hero.connect(lambda: c.lock_view(self.race_day.hero.view))
+        self.race_day.lock_race.connect(self._lock_race)
         self.details.lock_pick.connect(lambda: c.lock_view(c.view_for_key(c.selected_key)))
-        self.details.refresh_race.connect(lambda: c.request_refresh("card", live=True, force=True))
+        self.details.refresh_race.connect(self._manual_refresh)
         self.settings_page.settings_saved.connect(self.controller.apply_settings)
+        self.settings_page.theme_changed.connect(self._apply_theme)
+        self.settings_page.reset_db_requested.connect(self._reset_db_path)
+
+    def _manual_refresh(self) -> None:
+        self.controller.request_manual_refresh()
+
+    @Slot(bool)
+    def _refresh_busy(self, busy: bool) -> None:
+        self.refresh_btn.setEnabled(not busy)
+        self.refresh_btn.setText("Refreshing…" if busy else "Refresh")
 
     def _page_changed(self, row: int) -> None:
         self.stack.setCurrentIndex(max(0, row))
@@ -130,6 +147,14 @@ class MainWindow(QMainWindow):
             self.history.set_range(self.controller.chosen_date, self.controller.settings.db_path)
         if name == "Settings":
             self.settings_page.load_into_widgets()
+            self.settings_page.set_diagnostics(self.controller.diagnostics())
+
+    def _reset_db_path(self) -> None:
+        self.controller.settings.reset_db_path()
+        self.controller.settings.sync()
+        self.settings_page.load_into_widgets()
+        self.settings_page.set_diagnostics(self.controller.diagnostics())
+        self.controller.apply_settings()
 
     def _date_changed(self, qdate: QDate) -> None:
         d = date(qdate.year(), qdate.month(), qdate.day())
@@ -139,45 +164,65 @@ class MainWindow(QMainWindow):
         self.controller.set_state(state)
 
     def _auto_toggled(self, on: bool) -> None:
-        self.controller.settings.auto_refresh = on
-        self.controller.apply_settings()
+        self.controller.set_auto_refresh(on)
 
     @Slot()
     def _apply_views(self) -> None:
         c = self.controller
-        now = c.now()
         prev = self.race_day.selected_upcoming_key()
-        upcoming = c.upcoming()
-        self.race_day.upcoming_model.set_rows([race_to_row(v, now) for v in upcoming])
-        self.race_day.hero.set_view(c.hero, now)
-        if not c.views:
-            self.race_day.empty.setText(
-                "No thoroughbred card loaded. If you are offline and have never loaded this date, "
-                "connect to the internet and press Refresh."
-            )
-        else:
-            self.race_day.empty.setText("")
+        state = c.sync_race_day()
+        self._bind_hero_and_upcoming(state, restore_key=prev)
         index = {}
         for p in c.picks:
             try:
                 index[(str(p.get("meeting_url") or ""), int(p.get("race_no") or 0))] = p
             except Exception:
                 continue
-        rows, summary = pick_rows_from_views(c.views, index, c.results, now)
+        rows, summary = pick_rows_from_views(c.views, index, c.results, state.now)
         self.race_day.picks_model.set_rows(rows)
+        self.race_day.picks.prefetch_silks()
         self.race_day.set_summary(summary)
-        if prev:
-            self.race_day.restore_selection(prev)
-        view = c.view_for_key(c.selected_key) or c.hero
+        view = c.view_for_key(c.selected_key) or state.hero
         if view is not None:
             self.details.set_view(view, odds_lookup=c.odds_lookup())
+        self.race_day.empty.setText(empty_label(c.stage, bool(c.views), c.last_error))
+        self.settings_page.set_diagnostics(c.diagnostics())
         self._restore_column_widths()
+
+    def _bind_hero_and_upcoming(self, state, *, restore_key=None) -> None:
+        now = state.now
+        lookup = self.controller.odds_lookup()
+        self.race_day.upcoming_model.set_rows([race_to_row(v, now, odds_lookup=lookup) for v in state.upcoming])
+        self.race_day.upcoming.prefetch_silks()
+        self.race_day.hero.set_view(state.hero, now)
+        if restore_key:
+            self.race_day.restore_selection(restore_key)
+
+    def _lock_race(self, key) -> None:
+        self.controller.lock_view(self.controller.view_for_key(key))
+
+    def _apply_theme(self, ident: str | None = None) -> None:
+        app = QApplication.instance()
+        wanted = ident or self.controller.settings.theme
+        if app is not None:
+            apply_to_application(app, wanted)
+        refresh_styled_widgets(self)
 
     @Slot()
     def _tick(self) -> None:
-        now = self.controller.now()
-        self.race_day.hero.tick(now)
-        self.race_day.upcoming_model.update_countdowns(now)
+        state = self.controller.last_race_day_state
+        if state is None:
+            state = self.controller.sync_race_day()
+        now = state.now
+        shown = self.race_day.hero.view
+        shown_key = shown.race_key if shown is not None else None
+        new_key = state.hero.race_key if state.hero is not None else None
+        if shown_key != new_key:
+            prev = self.race_day.selected_upcoming_key()
+            self._bind_hero_and_upcoming(state, restore_key=prev)
+        else:
+            self.race_day.hero.tick(now)
+            self.race_day.upcoming_model.update_countdowns(now)
 
     def _open_race(self, key) -> None:
         view = self.controller.select_race(key)
@@ -191,7 +236,7 @@ class MainWindow(QMainWindow):
         labels = {
             "ok": ("● Data OK", "healthOk"),
             "warn": ("● Partial / cached", "healthWarn"),
-            "cached": ("● Cached", "healthWarn"),
+            "cached": ("● Cached — refreshing", "healthWarn"),
             "error": ("● Refresh failed", "healthErr"),
             "idle": ("● Idle", "muted"),
         }
@@ -214,16 +259,20 @@ class MainWindow(QMainWindow):
             self.resize(1280, 800)
 
     def _restore_column_widths(self) -> None:
-        for name, view in (("upcoming", self.race_day.upcoming), ("picks", self.race_day.picks)):
-            widths = self.controller.settings.column_widths(name)
-            for i, w in enumerate(widths):
-                if w > 20:
-                    view.setColumnWidth(i, w)
+        for name, view in self._tables():
+            view.apply_column_widths(self.controller.settings.column_widths(name))
 
     def _save_column_widths(self) -> None:
-        for name, view in (("upcoming", self.race_day.upcoming), ("picks", self.race_day.picks)):
-            widths = [view.columnWidth(i) for i in range(view.model().columnCount())]
-            self.controller.settings.set_column_widths(name, widths)
+        for name, view in self._tables():
+            self.controller.settings.set_column_widths(name, view.current_column_widths())
+
+    def _tables(self):
+        return (
+            ("upcoming", self.race_day.upcoming),
+            ("picks", self.race_day.picks),
+            ("details", self.details.table),
+            ("history", self.history.table),
+        )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.controller.settings.set_geometry(self.saveGeometry())

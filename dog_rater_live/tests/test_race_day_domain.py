@@ -25,7 +25,7 @@ from services.pick_service import (
     record_primary_scratching,
     save_selection_snapshot,
 )
-from services.race_day_service import build_race_views, next_to_jump, upcoming_races
+from services.race_day_service import build_race_views, jump_datetime, next_to_jump, upcoming_races
 from services.result_service import (
     AWAITING_RESULT,
     BACKUP_WON,
@@ -441,6 +441,195 @@ def test_chronological_next_to_jump_ordering():
     assert all(v.jump_at < now for v in finished)
 
 
+def _hero_view(
+    *,
+    url: str,
+    venue: str,
+    raw: str,
+    no: int,
+    jump: datetime,
+    status: str,
+    state: str = "NSW",
+):
+    from services.race_day_service import RaceView
+
+    return RaceView(
+        meeting_url=url,
+        race_url="",
+        code="thoroughbred",
+        venue=venue,
+        venue_raw=raw,
+        state=state,
+        race_no=no,
+        race_name=f"R{no}",
+        race_class="",
+        distance_m=1250,
+        track_condition="Good4",
+        jump_at=jump,
+        status=status,
+        primary="Alpha",
+        primary_no="3",
+        backup="Beta",
+        backup_no="8",
+        primary_score=0.5,
+        backup_score=0.4,
+        score_gap=0.1,
+        confidence_label=LABEL_MEDIUM,
+        odds=None,
+        backup_odds=None,
+        field_size=8,
+        scratching_warning=False,
+        locked=False,
+        from_snapshot=False,
+        live_status=status,
+    )
+
+
+def test_next_to_jump_holds_while_race_running():
+    jumping = _hero_view(
+        url="https://example.test/cannon",
+        venue="Cannon Park (QLD)",
+        raw="Cannon Park",
+        no=1,
+        jump=datetime(2026, 8, 29, 13, 14, tzinfo=SYD),
+        status="in_progress",
+        state="QLD",
+    )
+    later = _hero_view(
+        url="https://example.test/cannon",
+        venue="Cannon Park (QLD)",
+        raw="Cannon Park",
+        no=2,
+        jump=datetime(2026, 8, 29, 13, 19, tzinfo=SYD),
+        status="upcoming",
+        state="QLD",
+    )
+    now = datetime(2026, 8, 29, 13, 16, tzinfo=SYD)
+    hero = next_to_jump([jumping, later], now)
+    assert hero is jumping
+    sticky = next_to_jump([jumping, later], now, sticky=jumping)
+    assert sticky is jumping
+    up = upcoming_races([jumping, later], now, limit=8)
+    assert later in up
+    assert jumping not in up
+
+
+def test_next_to_jump_yields_when_next_is_imminent():
+    jumping = _hero_view(
+        url="https://example.test/cannon",
+        venue="Cannon Park (QLD)",
+        raw="Cannon Park",
+        no=1,
+        jump=datetime(2026, 8, 29, 13, 14, tzinfo=SYD),
+        status="in_progress",
+        state="QLD",
+    )
+    later = _hero_view(
+        url="https://example.test/cannon",
+        venue="Cannon Park (QLD)",
+        raw="Cannon Park",
+        no=2,
+        jump=datetime(2026, 8, 29, 13, 16, tzinfo=SYD),
+        status="upcoming",
+        state="QLD",
+    )
+    now = datetime(2026, 8, 29, 13, 15, 30, tzinfo=SYD)
+    assert next_to_jump([jumping, later], now) is later
+
+
+def test_next_to_jump_prefers_metro_when_times_match():
+    picnic = _hero_view(
+        url="https://example.test/betoota",
+        venue="Betoota (QLD)",
+        raw="Betoota",
+        no=1,
+        jump=datetime(2026, 8, 29, 13, 30, tzinfo=SYD),
+        status="upcoming",
+        state="QLD",
+    )
+    rosehill = _hero_view(
+        url="https://example.test/rosehill",
+        venue="Rosehill Gardens (NSW)",
+        raw="Rosehill Gardens",
+        no=1,
+        jump=datetime(2026, 8, 29, 13, 30, tzinfo=SYD),
+        status="upcoming",
+    )
+    now = datetime(2026, 8, 29, 13, 27, tzinfo=SYD)
+    assert next_to_jump([picnic, rosehill], now) is rosehill
+    up = upcoming_races([picnic, rosehill], now, limit=8)
+    assert up[0] is picnic
+
+
+def test_next_to_jump_yields_to_upcoming_after_hold():
+    jumped = _hero_view(
+        url="https://example.test/kembla",
+        venue="Kembla Grange (NSW)",
+        raw="Kembla Grange",
+        no=2,
+        jump=datetime(2026, 8, 29, 13, 15, tzinfo=SYD),
+        status="in_progress",
+    )
+    nxt = _hero_view(
+        url="https://example.test/kembla",
+        venue="Kembla Grange (NSW)",
+        raw="Kembla Grange",
+        no=3,
+        jump=datetime(2026, 8, 29, 13, 26, tzinfo=SYD),
+        status="upcoming",
+    )
+    now = datetime(2026, 8, 29, 13, 22, tzinfo=SYD)
+    assert next_to_jump([jumped, nxt], now) is nxt
+
+
+def test_next_to_jump_does_not_sticky_a_later_upcoming_race():
+    """Screenshot: Mudgee was hero first; Wyong must still win once it is in views."""
+    now = datetime(2026, 8, 30, 12, 24, tzinfo=SYD)
+    wyong = _hero_view(
+        url="https://example.test/wyong",
+        venue="Wyong (NSW)",
+        raw="Wyong",
+        no=1,
+        jump=datetime(2026, 8, 30, 12, 35, tzinfo=SYD),
+        status="upcoming",
+    )
+    casterton = _hero_view(
+        url="https://example.test/casterton",
+        venue="Casterton (VIC)",
+        raw="Casterton",
+        no=1,
+        jump=datetime(2026, 8, 30, 12, 40, tzinfo=SYD),
+        status="upcoming",
+        state="VIC",
+    )
+    mudgee = _hero_view(
+        url="https://example.test/mudgee",
+        venue="Mudgee (NSW)",
+        raw="Mudgee",
+        no=1,
+        jump=datetime(2026, 8, 30, 13, 25, tzinfo=SYD),
+        status="upcoming",
+    )
+    for row in (wyong, casterton, mudgee):
+        assert row.jump_at is not None and row.jump_at.tzinfo is not None
+        assert row.jump_at.date() == date(2026, 8, 30)
+
+    from services.race_day_service import derive_race_day_state
+
+    state = derive_race_day_state([mudgee, casterton, wyong], now, sticky=mudgee, limit=12)
+    assert state.hero is wyong
+    assert wyong.race_key not in {r.race_key for r in state.upcoming}
+    assert state.upcoming[0] is casterton
+    assert mudgee in state.upcoming
+    assert next_to_jump([mudgee, wyong], now, sticky=mudgee) is wyong
+    from services.formatting import format_countdown
+
+    now = datetime(2026, 8, 29, 13, 22, 19, tzinfo=SYD)
+    assert format_countdown(datetime(2026, 8, 29, 13, 26, tzinfo=SYD), now) == "4m"
+    assert format_countdown(datetime(2026, 8, 29, 13, 30, tzinfo=SYD), now) == "8m"
+    assert format_countdown(datetime(2026, 8, 29, 13, 15, tzinfo=SYD), now) == "Jumped"
+
+
 def test_autolock_near_jump_preserves_snapshot(tmp_path: Path):
     db = tmp_path / "roster.db"
     d = date(2026, 8, 29)
@@ -611,3 +800,73 @@ def test_persist_results_roundtrip(tmp_path: Path):
     assert stored[1]["winner"] == "Alpha"
     assert stored[1]["place2"] == "Beta"
     assert stored[1]["status"] == "ok"
+
+
+def test_jump_datetime_orders_by_instant_not_clock_string():
+    """NSW/VIC/SA on DST, QLD not — same local HH:MM is not the same instant."""
+    chosen = date(2026, 10, 4)
+    app_tz = ZoneInfo("Australia/Sydney")
+    now = datetime(2026, 10, 4, 11, 0, tzinfo=app_tz)
+    assert now.tzinfo is not None
+
+    def mtg(venue: str, state: str, url: str) -> Meeting:
+        return Meeting(
+            code="thoroughbred",
+            source="racingaustralia",
+            venue=venue,
+            meeting_date=chosen,
+            first_race_time_local=time(12, 0),
+            num_races=1,
+            meeting_url=url,
+            status="upcoming",
+            extra={"state": state, "key": f"2026Oct04,{state},{venue}"},
+        )
+
+    gawler = mtg("Gawler", "SA", "https://example.test/gawler")
+    wyong = mtg("Wyong", "NSW", "https://example.test/wyong")
+    casterton = mtg("Casterton", "VIC", "https://example.test/casterton")
+    toowoomba = mtg("Toowoomba", "QLD", "https://example.test/toowoomba")
+
+    jumps = {
+        "gawler": jump_datetime(chosen_date=chosen, start_time_local=time(12, 0), meeting=gawler, app_tz=app_tz),
+        "wyong": jump_datetime(chosen_date=chosen, start_time_local=time(12, 35), meeting=wyong, app_tz=app_tz),
+        "casterton": jump_datetime(chosen_date=chosen, start_time_local=time(13, 0), meeting=casterton, app_tz=app_tz),
+        "toowoomba": jump_datetime(chosen_date=chosen, start_time_local=time(12, 40), meeting=toowoomba, app_tz=app_tz),
+    }
+    for label, dt in jumps.items():
+        assert dt is not None, label
+        assert dt.tzinfo is not None, label
+        assert dt.astimezone(app_tz).date() == chosen, label
+
+    # Lexicographic local clocks would put Toowoomba 12:40 before Casterton 13:00.
+    assert jumps["gawler"] < jumps["wyong"] < jumps["casterton"] < jumps["toowoomba"]
+    assert jumps["toowoomba"].strftime("%H:%M") != jumps["wyong"].strftime("%H:%M") or jumps["toowoomba"] != jumps["wyong"]
+
+    from services.race_day_service import RaceView, derive_race_day_state
+
+    def rv(name: str, meeting: Meeting, jump: datetime) -> RaceView:
+        return _hero_view(
+            url=meeting.meeting_url,
+            venue=f"{name} ({meeting.extra['state']})",
+            raw=name,
+            no=1,
+            jump=jump,
+            status="upcoming",
+            state=str(meeting.extra["state"]),
+        )
+
+    views = [
+        rv("Toowoomba", toowoomba, jumps["toowoomba"]),
+        rv("Casterton", casterton, jumps["casterton"]),
+        rv("Wyong", wyong, jumps["wyong"]),
+        rv("Gawler", gawler, jumps["gawler"]),
+    ]
+    state = derive_race_day_state(views, now, limit=12)
+    assert state.hero is not None
+    assert state.hero.venue_raw == "Gawler"
+    assert [v.venue_raw for v in state.upcoming] == ["Wyong", "Casterton", "Toowoomba"]
+    future = [v for v in views if v.jump_at is not None and v.jump_at > now]
+    earliest = min(future, key=lambda v: v.jump_at)
+    assert state.hero.jump_at == earliest.jump_at
+    assert all(v.jump_at.tzinfo is not None for v in future)
+

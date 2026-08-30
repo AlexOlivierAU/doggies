@@ -24,11 +24,16 @@ PLACED = "PLACED"
 LOST = "LOST"
 PRIMARY_SCRATCHED = "PRIMARY SCRATCHED"
 BACKUP_WON = "BACKUP WON"
+BACKUP_PROMOTED = "BACKUP PROMOTED"
+BOTH_SCRATCHED = "BOTH PICKS SCRATCHED"
+NO_ACTIVE_SELECTION = "NO ACTIVE SELECTION"
 VOID = "VOID"
 RESULT_UNAVAILABLE = "RESULT UNAVAILABLE"
 
 TERMINAL_FOR_STRIKE = frozenset({WIN, PLACED, LOST})
-COMPLETED_STATUSES = frozenset({WIN, PLACED, LOST, BACKUP_WON, PRIMARY_SCRATCHED, VOID, RESULT_UNAVAILABLE})
+COMPLETED_STATUSES = frozenset(
+    {WIN, PLACED, LOST, BACKUP_WON, PRIMARY_SCRATCHED, BACKUP_PROMOTED, BOTH_SCRATCHED, NO_ACTIVE_SELECTION, VOID, RESULT_UNAVAILABLE}
+)
 
 
 @dataclass(frozen=True)
@@ -122,14 +127,22 @@ def resolve_pick_result(
             fetch_failed=True,
         )
 
-    if not jumped:
-        return ResolvedPick(PENDING, None, None, "—", "—", "", "pending")
-
-    primary = str(pick.get("pick_name") or pick.get("original_primary") or "")
-    if pick.get("original_primary"):
-        primary = str(pick.get("original_primary") or primary)
-    backup = str(pick.get("backup") or "")
+    primary = str(pick.get("original_primary") or pick.get("pick_name") or "")
+    backup = str(pick.get("original_backup") or pick.get("backup") or "")
     primary_scratched = bool(pick.get("primary_scratched"))
+    backup_scratched = bool(pick.get("backup_scratched"))
+    backup_promoted = bool(pick.get("backup_promoted"))
+
+    if not jumped:
+        if primary_scratched and backup_scratched:
+            return ResolvedPick(BOTH_SCRATCHED, None, None, "SCR", "SCR", "", "both_scratched")
+        if primary_scratched and not str(pick.get("active_primary") or ""):
+            return ResolvedPick(NO_ACTIVE_SELECTION, None, None, "SCR", "SCR", "", "no_active")
+        if primary_scratched and backup_promoted:
+            return ResolvedPick(BACKUP_PROMOTED, None, None, "SCR", "—", "", "backup_promoted")
+        if primary_scratched:
+            return ResolvedPick(PRIMARY_SCRATCHED, None, None, "SCR", "—", "", "primary_scratched")
+        return ResolvedPick(PENDING, None, None, "—", "—", "", "pending")
 
     if not winner:
         return ResolvedPick(AWAITING_RESULT, None, None, "—", "—", source, "awaiting")
@@ -155,6 +168,16 @@ def resolve_pick_result(
         )
 
     if primary_scratched:
+        if backup_scratched and b_fin != 1:
+            return ResolvedPick(
+                BOTH_SCRATCHED,
+                None,
+                None,
+                "SCR",
+                "SCR",
+                source,
+                "both_scratched",
+            )
         if b_fin == 1:
             return ResolvedPick(
                 BACKUP_WON,

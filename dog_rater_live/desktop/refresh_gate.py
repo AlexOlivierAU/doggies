@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-_PRIORITY = {"card": 3, "all": 2, "odds": 1, "results": 1}
+# Higher number runs first when several jobs are queued.
+_PRIORITY = {"cached": 4, "card": 3, "all": 2, "odds": 2, "results": 1}
 
 
 def merge_kinds(a: Optional[str], b: Optional[str]) -> Optional[str]:
@@ -14,6 +15,8 @@ def merge_kinds(a: Optional[str], b: Optional[str]) -> Optional[str]:
         return a
     if a == b:
         return a
+    if "cached" in (a, b) and "card" in (a, b):
+        return "card"
     if "card" in (a, b):
         return "card"
     if {a, b} == {"odds", "results"} or "all" in (a, b):
@@ -22,24 +25,33 @@ def merge_kinds(a: Optional[str], b: Optional[str]) -> Optional[str]:
 
 
 class RefreshGate:
-    """If a job is running, remember the next kind instead of starting another."""
+    """If a job is running, remember follow-up kinds instead of starting another.
+
+    Pending jobs are kept as a set so coalescing never drops a required follow-up
+    (e.g. results queued while odds is already pending).
+    """
 
     def __init__(self) -> None:
         self.busy = False
-        self.pending: Optional[str] = None
+        self.pending: set[str] = set()
 
     def request(self, kind: str) -> bool:
         """True if the caller should start work now."""
         if self.busy:
-            self.pending = merge_kinds(self.pending, kind)
+            self.pending.add(kind)
             return False
         self.busy = True
-        self.pending = None
+        self.pending.discard(kind)
         return True
 
     def finish(self) -> Optional[str]:
-        """Clear busy. Return a coalesced follow-up kind, if any."""
+        """Clear busy. Return the highest-priority follow-up kind, if any."""
         self.busy = False
-        pending = self.pending
-        self.pending = None
-        return pending
+        if not self.pending:
+            return None
+        kind = max(self.pending, key=lambda k: _PRIORITY.get(k, 0))
+        self.pending.discard(kind)
+        return kind
+
+    def has_pending(self, kind: str) -> bool:
+        return kind in self.pending

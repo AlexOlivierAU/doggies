@@ -224,10 +224,171 @@ def record_primary_scratching(
     meeting_url: str,
     race_no: int,
     db_path: Path = _DEFAULT_DB,
+    **kwargs,
 ) -> dict[str, Any] | None:
     d = _as_date(meeting_date)
-    mark_primary_scratched(d, meeting_url, int(race_no), db_path=db_path)
+    mark_primary_scratched(d, meeting_url, int(race_no), db_path=db_path, **kwargs)
     return get_pick(d, meeting_url, int(race_no), db_path=db_path)
+
+
+def apply_view_scratching(
+    view,
+    *,
+    chosen_date: date | str,
+    db_path: Path = _DEFAULT_DB,
+    now: Optional[datetime] = None,
+) -> dict[str, Any] | None:
+    """Persist late-scratching flags and unlocked rerank. Idempotent. Does not rewrite locked originals."""
+    from services.scratching import log_late_scratch_transition
+
+    if not getattr(view, "primary_scratched", False) and not getattr(view, "backup_scratched", False):
+        return None
+    d = _as_date(chosen_date)
+    existing = get_pick(d, view.meeting_url, int(view.race_no), db_path=db_path)
+    sources = []
+    for _name, srcs in (getattr(view, "scratching_sources", None) or {}).items():
+        for s in srcs or []:
+            if s not in sources:
+                sources.append(s)
+    source = ",".join(sources) or "sportsbet"
+    detected = getattr(view, "scratch_confirmed_at", "") or (now.isoformat(timespec="seconds") if now else "")
+    horse = getattr(view, "original_primary", "") or (existing or {}).get("pick_name") or ""
+
+    if existing and existing.get("locked"):
+        updated_ok = mark_primary_scratched(
+            d,
+            view.meeting_url,
+            int(view.race_no),
+            db_path=db_path,
+            source=source,
+            detected_at=detected,
+            active_primary=view.primary,
+            active_backup=view.backup,
+            backup_scratched=bool(getattr(view, "backup_scratched", False)),
+            backup_promoted=bool(getattr(view, "backup_promoted", False)),
+            original_backup=getattr(view, "original_backup", "") or "",
+        )
+        if updated_ok:
+            log_late_scratch_transition(
+                venue=view.venue_raw or view.venue,
+                race_no=view.race_no,
+                horse=horse,
+                source=source,
+                locked=True,
+                new_primary=view.primary,
+                new_backup=view.backup,
+            )
+        return get_pick(d, view.meeting_url, int(view.race_no), db_path=db_path)
+
+    # Unlocked: rewrite live autosave with new active names; keep original_* for audit.
+    if existing and existing.get("locked"):
+        return existing
+    orig_p = str((existing or {}).get("original_primary") or (existing or {}).get("pick_name") or view.original_primary or "")
+    orig_b = str((existing or {}).get("original_backup") or (existing or {}).get("backup") or view.original_backup or "")
+    same = (
+        existing
+        and str(existing.get("pick_name") or "") == (view.primary or "")
+        and str(existing.get("backup") or "") == (view.backup or "")
+        and bool(existing.get("primary_scratched")) == bool(view.primary_scratched)
+        and str(existing.get("active_primary") or "") == (view.primary or "")
+    )
+    if same:
+        return existing
+    if not view.primary:
+        # No active selection: flag only, do not write an invalid snapshot name.
+        if existing:
+            mark_primary_scratched(
+                d,
+                view.meeting_url,
+                int(view.race_no),
+                db_path=db_path,
+                source=source,
+                detected_at=detected,
+                active_primary="",
+                active_backup="",
+                backup_scratched=True,
+                original_backup=orig_b,
+            )
+            log_late_scratch_transition(
+                venue=view.venue_raw or view.venue,
+                race_no=view.race_no,
+                horse=horse,
+                source=source,
+                locked=False,
+                new_primary="",
+                new_backup="",
+            )
+            return get_pick(d, view.meeting_url, int(view.race_no), db_path=db_path)
+        return None
+
+    payload = build_snapshot_payload(
+        meeting_date=d,
+        code=view.code,
+        venue=view.venue_raw or view.venue,
+        meeting_url=view.meeting_url,
+        race_no=view.race_no,
+        race_name=view.race_name or f"R{view.race_no}",
+        race_url=view.race_url,
+        primary=view.primary,
+        backup=view.backup,
+        primary_score=view.primary_score,
+        backup_score=view.backup_score,
+        why_bullets=list(view.why or []),
+        weights=view.weights,
+        field=snapshot_field(view.runners),
+        scratching_state=[
+            {"name": n, "scratched": True, "sources": srcs, "confirmed_at": detected}
+            for n, srcs in (view.scratching_sources or {}).items()
+        ],
+        primary_odds=view.odds,
+        backup_odds=view.backup_odds,
+        scheduled_jump=view.jump_at.isoformat() if view.jump_at else "",
+        track_condition=view.track_condition,
+        status=view.status,
+        field_size=view.field_size,
+    )
+    payload["original_primary"] = orig_p or view.original_primary
+    payload["original_backup"] = orig_b or view.original_backup
+    save_pick(
+        d,
+        view.meeting_url,
+        view.code,
+        int(view.race_no),
+        view.venue_raw or view.venue,
+        view.race_name or f"R{view.race_no}",
+        view.primary,
+        backup=view.backup,
+        pick_data=payload,
+        best_score=view.primary_score,
+        backup_score=view.backup_score,
+        field_size=view.field_size,
+        status=view.status,
+        confidence_label=view.confidence_label,
+        score_gap=view.score_gap,
+        primary_odds=view.odds,
+        backup_odds=view.backup_odds,
+        original_primary=orig_p or view.original_primary,
+        original_backup=orig_b or view.original_backup,
+        primary_scratched=bool(view.primary_scratched),
+        backup_scratched=bool(view.backup_scratched),
+        backup_promoted=bool(view.backup_promoted),
+        scratching_source=source,
+        scratching_detected_at=detected,
+        active_primary=view.primary,
+        active_backup=view.backup,
+        scheduled_jump=view.jump_at.isoformat() if view.jump_at else "",
+        db_path=db_path,
+    )
+    log_late_scratch_transition(
+        venue=view.venue_raw or view.venue,
+        race_no=view.race_no,
+        horse=horse,
+        source=source,
+        locked=False,
+        new_primary=view.primary,
+        new_backup=view.backup,
+    )
+    return get_pick(d, view.meeting_url, int(view.race_no), db_path=db_path)
 
 
 def snapshot_field(runners: list, ranked_by_name: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
@@ -245,6 +406,7 @@ def snapshot_field(runners: list, ranked_by_name: Optional[dict[str, Any]] = Non
                 "trainer": getattr(r, "trainer", None),
                 "weight_kg": getattr(r, "weight_kg", None),
                 "last10": getattr(r, "last10", None),
+                "silk_url": getattr(r, "silk_url", None),
                 "score": float(getattr(ranked, "score", 0.0) or 0.0) if ranked is not None else None,
                 "rank": getattr(ranked, "rank", None) if ranked is not None else None,
             }

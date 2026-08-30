@@ -10,21 +10,23 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QHBoxLayout,
     QLabel,
-    QHeaderView,
-    QTableView,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from desktop.models.picks_table_model import PicksTableModel
+from desktop.widgets.styled_table import StyledTableView
 from race_db import get_pick, load_picks_range, load_results_range
 from services.confidence import LABEL_CLOSE, LABEL_MEDIUM, LABEL_STRONG
 from services.formatting import format_saved_selection
 from services.result_service import (
     AWAITING_RESULT,
+    BACKUP_PROMOTED,
     BACKUP_WON,
+    BOTH_SCRATCHED,
     LOST,
+    NO_ACTIVE_SELECTION,
     PENDING,
     PLACED,
     PRIMARY_SCRATCHED,
@@ -42,6 +44,9 @@ _STATUSES = [
     PLACED,
     LOST,
     PRIMARY_SCRATCHED,
+    BACKUP_PROMOTED,
+    BOTH_SCRATCHED,
+    NO_ACTIVE_SELECTION,
     BACKUP_WON,
     VOID,
     RESULT_UNAVAILABLE,
@@ -62,13 +67,11 @@ class HistoryPage(QWidget):
         self.conf = QComboBox()
         self.conf.addItems(["All", LABEL_STRONG, LABEL_MEDIUM, LABEL_CLOSE])
         self.model = PicksTableModel(self)
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table = StyledTableView(self, sorting=True, name="history")
+        self.table.set_source_model(self.model)
+        self.table.set_pick_columns([4, 7], compact=True)
+        self.table.set_odds_columns([6])
+        self.table.set_badge_columns([0, 9])
         self.table.selectionModel().currentRowChanged.connect(self._show_snapshot)
         self.detail = QTextEdit()
         self.detail.setReadOnly(True)
@@ -168,14 +171,16 @@ class HistoryPage(QWidget):
                 continue
             rows.append(rec)
         self.model.set_rows(rows)
+        self.table.prefetch_silks()
         if rows:
-            self.table.selectRow(0)
-            self._show_snapshot(self.model.index(0, 0), None)
+            src = self.model.index(0, 0)
+            self.table.selectRow(self.table.proxy.mapFromSource(src).row())
+            self._show_snapshot(self.table.proxy.mapFromSource(src), None)
         else:
             self.detail.setPlainText("No snapshots match these filters.")
 
     def _show_snapshot(self, current, _prev) -> None:
-        row = self.model.row_at(current.row()) if current.isValid() else None
+        row = self.table.source_row(current) if current is not None else None
         if not row or self._db_path is None:
             return
         try:
@@ -202,7 +207,9 @@ class HistoryPage(QWidget):
                     f"Backup: {format_saved_selection(snap, 'backup')}",
                     f"Confidence: {snap.get('confidence_label')} (gap {snap.get('score_gap')})",
                     f"Odds at selection: {snap.get('primary_odds')} / backup {snap.get('backup_odds')}",
-                    f"Primary scratched: {bool(snap.get('primary_scratched'))}  Backup promoted: {bool(snap.get('backup_promoted'))}",
+                    f"Primary scratched: {bool(snap.get('primary_scratched'))}  Backup scratched: {bool(snap.get('backup_scratched'))}  Backup promoted: {bool(snap.get('backup_promoted'))}",
+                    f"Scratching source: {snap.get('scratching_source') or '—'}  detected: {snap.get('scratching_detected_at') or '—'}",
+                    f"Active / promoted: {snap.get('active_primary') or '—'}  replacement backup: {snap.get('active_backup') or '—'}",
                     f"Confirmed result: {row.get('result')}",
                     "",
                     "Saved field snapshot (numbers as captured, not live):",

@@ -10,8 +10,11 @@ import streamlit as st
 from services.formatting import format_runner_pick
 from services.result_service import (
     AWAITING_RESULT,
+    BACKUP_PROMOTED,
     BACKUP_WON,
+    BOTH_SCRATCHED,
     LOST,
+    NO_ACTIVE_SELECTION,
     PENDING,
     PLACED,
     PRIMARY_SCRATCHED,
@@ -28,6 +31,9 @@ _STATUS_STYLE = {
     PENDING: ("#e65100", "#fff3e0"),
     AWAITING_RESULT: ("#ef6c00", "#fff8e1"),
     PRIMARY_SCRATCHED: ("#616161", "#eeeeee"),
+    BACKUP_PROMOTED: ("#4a148c", "#f3e5f5"),
+    BOTH_SCRATCHED: ("#b71c1c", "#fbe9e7"),
+    NO_ACTIVE_SELECTION: ("#b71c1c", "#fbe9e7"),
     VOID: ("#616161", "#eeeeee"),
     RESULT_UNAVAILABLE: ("#546e7a", "#eceff1"),
 }

@@ -13,8 +13,11 @@ from services.confidence import LABEL_CLOSE, LABEL_MEDIUM, LABEL_STRONG
 from services.formatting import format_saved_selection
 from services.result_service import (
     AWAITING_RESULT,
+    BACKUP_PROMOTED,
     BACKUP_WON,
+    BOTH_SCRATCHED,
     LOST,
+    NO_ACTIVE_SELECTION,
     PENDING,
     PLACED,
     PRIMARY_SCRATCHED,
@@ -36,6 +39,9 @@ _STATUSES = [
     PLACED,
     LOST,
     PRIMARY_SCRATCHED,
+    BACKUP_PROMOTED,
+    BOTH_SCRATCHED,
+    NO_ACTIVE_SELECTION,
     BACKUP_WON,
     VOID,
     RESULT_UNAVAILABLE,

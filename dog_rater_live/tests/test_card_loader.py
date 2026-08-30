@@ -89,6 +89,52 @@ def test_failed_live_refresh_keeps_cached_card(tmp_path: Path, monkeypatch):
     assert payload.fields_by_meeting[meetings[0].meeting_url]["runners_by_race"][1]
 
 
+def test_refresh_card_keeps_meetings_when_one_state_fails(tmp_path: Path, monkeypatch):
+    from parse_racingaustralia import MeetingList
+
+    d = date(2026, 8, 29)
+    db = tmp_path / "roster.db"
+    kept = [_meeting()]
+    failed = MeetingList(kept, failed_states=["QLD"], failed_details=["QLD: timeout"])
+    monkeypatch.setattr("services.card_loader.fetch_tb_meetings", lambda *a, **k: failed)
+    monkeypatch.setattr(
+        "services.card_loader.fetch_tb_fields",
+        lambda *a, **k: (
+            _fields()["https://example.test/m"]["races"],
+            _fields()["https://example.test/m"]["runners_by_race"],
+            {},
+        ),
+    )
+    payload = refresh_card(d, db_path=db, live=True, force=True)
+    assert payload.meetings
+    assert payload.failed_states == ["QLD"]
+    assert any("QLD" in e for e in payload.errors)
+    assert payload.status == "partial"
+
+
+def test_diagnostics_offline_uses_cache(tmp_path: Path):
+    from desktop.diagnostics import format_report, run_diagnostics
+
+    d = date(2026, 8, 29)
+    db = tmp_path / "roster.db"
+    meetings = [_meeting()]
+    fields = _fields()
+    persist_daily_meetings(d, MEETINGS_CODE, meetings, db_path=db)
+    persist_daily_fields(
+        d,
+        meetings[0].meeting_url,
+        (fields[meetings[0].meeting_url]["races"], fields[meetings[0].meeting_url]["runners_by_race"], {}),
+        db_path=db,
+    )
+    stats = run_diagnostics(d, live=False, db_path=db)
+    text = format_report(stats)
+    assert str(db.resolve()) in stats["database"] or str(db) in stats["database"]
+    assert stats["cached_meetings"] >= 1
+    assert stats["views_built"] >= 1
+    assert "Database:" in text
+    assert "Errors:" in text
+
+
 def test_refresh_without_live_uses_db(tmp_path: Path):
     d = date(2026, 8, 29)
     db = tmp_path / "roster.db"

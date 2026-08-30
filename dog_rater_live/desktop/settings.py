@@ -8,7 +8,8 @@ from typing import Any
 from PySide6.QtCore import QByteArray, QSettings
 
 from desktop import APP_NAME, ORG_NAME
-from race_db import _DEFAULT_DB
+from desktop.paths import shared_default_db_path
+from race_db import default_db_path
 
 STATES = ("All", "NSW", "VIC", "QLD", "SA", "WA", "TAS")
 TIMEZONES = ("Australia/Sydney", "Australia/Brisbane", "Australia/Adelaide", "Australia/Perth", "Pacific/Auckland", "Local (server)")
@@ -17,6 +18,8 @@ TIMEZONES = ("Australia/Sydney", "Australia/Brisbane", "Australia/Adelaide", "Au
 class DesktopSettings:
     def __init__(self, settings: QSettings | None = None) -> None:
         self._s = settings or QSettings(ORG_NAME, APP_NAME)
+        self.db_path_warning = ""
+        self.obsolete_db_path = ""
 
     def _get(self, key: str, default: Any, cast=None):
         val = self._s.value(key, default)
@@ -92,20 +95,66 @@ class DesktopSettings:
 
     @property
     def theme(self) -> str:
-        return self._get("theme", "dark", str)
+        from desktop.themes.theme_manager import migrate_qsettings
+
+        return migrate_qsettings(self._s)
 
     @theme.setter
     def theme(self, value: str) -> None:
-        self._s.setValue("theme", value)
+        from desktop.themes import THEME_BLUE, THEME_IDS, normalize_theme_id
+
+        ident = normalize_theme_id(value)
+        if ident not in THEME_IDS:
+            ident = THEME_BLUE
+        self._s.setValue("theme", ident)
+        self._s.setValue("theme_explicit", True)
+
+    @property
+    def theme_explicit(self) -> bool:
+        val = self._s.value("theme_explicit", False)
+        if isinstance(val, bool):
+            return val
+        return str(val).lower() in {"1", "true", "yes"}
+
+    @property
+    def stored_db_path(self) -> str:
+        return self._get("db_path", "", str).strip()
 
     @property
     def db_path(self) -> Path:
-        raw = self._get("db_path", str(_DEFAULT_DB), str)
-        return Path(raw).expanduser()
+        """Absolute database path. Invalid/relative QSettings values fall back to the app default."""
+        self.db_path_warning = ""
+        self.obsolete_db_path = ""
+        default = shared_default_db_path()
+        raw = self.stored_db_path
+        if not raw:
+            return default
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            self.obsolete_db_path = raw
+            self.db_path_warning = f"Stored database path is not absolute: {raw}"
+            return default
+        if p.exists():
+            return p.resolve()
+        if p.parent.exists() or p.resolve() == default:
+            return p if not p.exists() else p.resolve()
+        self.obsolete_db_path = str(p)
+        self.db_path_warning = f"Configured database does not exist: {p}"
+        return default
 
     @db_path.setter
     def db_path(self, value: Path | str) -> None:
-        self._s.setValue("db_path", str(value))
+        path = Path(value).expanduser()
+        if path.exists():
+            path = path.resolve()
+        elif not path.is_absolute():
+            path = default_db_path().parent / path.name
+        self._s.setValue("db_path", str(path))
+
+    def reset_db_path(self) -> None:
+        self._s.remove("db_path")
+        self.db_path_warning = ""
+        self.obsolete_db_path = ""
 
     @property
     def other_codes_enabled(self) -> bool:

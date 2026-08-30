@@ -36,11 +36,12 @@ class NotificationService:
                 )
                 if msg:
                     out.append(msg)
-            if getattr(view, "scratching_warning", False):
+            if getattr(view, "scratching_warning", False) or getattr(view, "primary_scratched", False):
+                horse = getattr(view, "original_primary", "") or getattr(view, "primary", "")
                 msg = self._emit(
-                    f"scratch:{key}",
+                    f"scratch:{key}:{horse}",
                     "Primary scratched",
-                    f"{view.venue} R{view.race_no}: scratching warning.",
+                    f"{view.venue} R{view.race_no}: {view.selection_warning or 'scratching warning'}.",
                 )
                 if msg:
                     out.append(msg)

@@ -77,11 +77,27 @@ def render_race_details(
         st.caption(view.race_url)
     if view.from_snapshot:
         st.info("Primary/backup below are the **saved snapshot**, not a live re-rank of an old race.")
+    if view.no_active_selection:
+        st.warning("NO ACTIVE SELECTION")
+    elif view.selection_warning:
+        st.warning(view.selection_warning)
     c1, c2, c3 = st.columns(3)
     with c1:
-        pick_metric("Primary", pick_cell(view.primary_no, view.primary, view.odds))
+        if view.no_active_selection:
+            pick_metric("Primary", "NO ACTIVE SELECTION")
+        elif view.locked and view.primary_scratched:
+            orig = pick_cell(view.original_primary_no, view.original_primary)
+            pick_metric("Original primary", f"{orig} — SCRATCHED")
+        else:
+            pick_metric("Primary", pick_cell(view.primary_no, view.primary, view.odds))
     with c2:
-        pick_metric("Backup", pick_cell(view.backup_no, view.backup, view.backup_odds))
+        if view.locked and view.primary_scratched:
+            pick_metric(
+                "Promoted primary",
+                pick_cell(view.primary_no, view.primary, view.odds) if view.primary else "NO ACTIVE SELECTION",
+            )
+        else:
+            pick_metric("Backup", pick_cell(view.backup_no, view.backup, view.backup_odds))
     with c3:
         st.metric("Confidence", view.confidence_label or "—")
 
@@ -137,6 +153,21 @@ def render_race_details(
                     st.write(f"- {b}")
             with st.expander("Score components", expanded=False):
                 st.json(rr.debug)
+
+    ranked_names = {getattr(rr, "name", "") for rr in ranked}
+    for runner in view.runners:
+        if getattr(runner, "name", "") in ranked_names:
+            continue
+        if not bool(getattr(runner, "scratched", False)):
+            continue
+        no = program_number_for_runner(runner)
+        src = ""
+        raw = getattr(runner, "raw", None) or {}
+        if isinstance(raw, dict) and raw.get("_scratch"):
+            src = ", ".join((raw["_scratch"].get("sources") or []) or [])
+        title = markdown_safe_pick(f"{format_runner_pick(number=no, name=runner.name)} · SCRATCHED")
+        with st.expander(title, expanded=False):
+            st.caption(f"Excluded from ranking. Source: {src or 'racingaustralia'}")
 
     if not ranked:
         st.warning("No active runners to rank for this race.")

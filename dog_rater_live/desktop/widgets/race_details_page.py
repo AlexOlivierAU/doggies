@@ -4,18 +4,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (
-    QHBoxLayout,
-    QLabel,
-    QHeaderView,
-    QPushButton,
-    QTableView,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
+from desktop.delegates.silk_pick_delegate import PickDelegate
 from desktop.models.details_table_model import DetailsTableModel, details_rows
+from desktop.widgets.runner_details_dialog import show_runner_details
+from desktop.widgets.styled_table import StyledTableView
 from services.formatting import format_runner_pick
 from services.ranking import rank_field
 
@@ -34,14 +28,15 @@ class RaceDetailsPage(QWidget):
         self.note = QLabel("")
         self.note.setObjectName("muted")
         self.model = DetailsTableModel(self)
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table = StyledTableView(self, sorting=True, name="details")
+        self.table.set_source_model(self.model)
+        self.table.set_silk_column(0)
+        self.table.set_odds_columns([4, 5])
+        self.table.set_class_columns([7])
+        self.table.set_badge_columns([12])
+        self.table.setItemDelegateForColumn(2, PickDelegate(self.table, compact=True, show_silk=False))
+        self.table.row_activated.connect(self._open_detail)
+        self.table.context_row.connect(self._menu)
         self.table.selectionModel().currentRowChanged.connect(self._row_changed)
         self.why = QTextEdit()
         self.why.setReadOnly(True)
@@ -94,17 +89,43 @@ class RaceDetailsPage(QWidget):
         )
         ranked, _w, _r = rank_field(view.runners, track_condition=view.meta.get("track_condition"))
         self.model.set_rows(details_rows(view, ranked, odds_lookup=odds_lookup))
+        self.table.prefetch_silks()
         self.lock_btn.setEnabled(bool(view.primary) and not view.locked)
         if self.model.rowCount():
-            self.table.selectRow(0)
+            src = self.model.index(0, 0)
+            mapped = self.table.proxy.mapFromSource(src)
+            self.table.selectRow(mapped.row())
+            self._fill_why(self.model.row_at(0))
 
     def _row_changed(self, current, _prev) -> None:
-        row = self.model.row_at(current.row())
+        self._fill_why(self.table.source_row(current))
+
+    def _open_detail(self, row) -> None:
+        if not row:
+            return
+        self._fill_why(row)
+        show_runner_details(row, self)
+
+    def _menu(self, row, pos) -> None:
+        if not row:
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Runner details")
+        src = menu.addAction("Open horse form")
+        chosen = menu.exec(pos)
+        if chosen is act:
+            show_runner_details(row, self)
+        elif chosen is src:
+            url = row.get("profile_url") or (self._view.race_url if self._view else "")
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
+
+    def _fill_why(self, row) -> None:
         if not row:
             self.why.clear()
             return
         lines = [
-            f"{row.get('name')} · barrier {row.get('barrier') or '—'} · No {row.get('no') or '—'}",
+            f"{row.get('raw_name')} · barrier {row.get('barrier') or '—'} · No {row.get('no') or '—'}",
             row.get("key_factors") or "",
         ]
         for b in row.get("why") or []:
